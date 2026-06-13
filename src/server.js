@@ -66,9 +66,9 @@ async function boot() {
 
     // Register bot command menu (the "/" list users see in Telegram)
     await bot.telegram.setMyCommands([
-      { command: 'start',  description: '🏠 Welcome & referral rewards'  },
+      { command: 'start',  description: '🏠 Welcome & weekly leaderboard'  },
       { command: 'invite', description: '🔗 Get your referral link'       },
-      { command: 'stats',  description: '📊 Your stats & tier progress'   },
+      { command: 'stats',  description: '📊 Your stats & weekly progress'   },
     ]);
     console.log('Bot commands registered.');
 

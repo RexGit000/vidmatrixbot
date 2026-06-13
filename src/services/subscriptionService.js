@@ -27,17 +27,17 @@ function buildSubscriptionSummary(subscription) {
 
   return [
     subscription.packageName,
-    `${subscription.dailyMediaCount} media/day`,
+    `${getSubscriptionDurationText(subscription)} / ${subscription.dailyMediaCount} 🎬 per day`,
     `expires ${formatISTDate(subscription.expiresAt)}`,
   ].join(' | ');
 }
 
 function getSubscriptionDurationText(subscriptionLike) {
   if (subscriptionLike?.durationMonths > 0) {
-    return `${subscriptionLike.durationMonths} calendar month${subscriptionLike.durationMonths !== 1 ? 's' : ''}`;
+    return `${subscriptionLike.durationMonths} months`;
   }
   if (subscriptionLike?.durationDays > 0) {
-    return `${subscriptionLike.durationDays} day${subscriptionLike.durationDays !== 1 ? 's' : ''}`;
+    return `${subscriptionLike.durationDays} days`;
   }
   return 'custom duration';
 }
@@ -175,8 +175,7 @@ function buildSubscriptionConfirmation(subscription) {
   return (
     `✅ Subscription confirmed!\n\n` +
     `Plan: ${subscription.packageName}\n` +
-    `Duration: ${getSubscriptionDurationText(subscription)}\n` +
-    `Daily delivery: ${subscription.dailyMediaCount} media/day\n` +
+    `Plan details: ${getSubscriptionDurationText(subscription)} / ${subscription.dailyMediaCount} 🎬 per day\n` +
     `Starts delivering: ${formatISTDateTime(subscription.deliveryStartsAt)}\n` +
     `Expires: ${formatISTDateTime(subscription.expiresAt)}`
   );

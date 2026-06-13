@@ -2,10 +2,8 @@ const User    = require('../models/User');
 const Package = require('../models/Package');
 const Settings = require('../models/Settings');
 const adminCache = require('../cache');
-const { POINTS_PER_MEDIA } = require('../constants');
-const { checkAndAwardTiers, buildTiersList } = require('../utils/referral');
 const { getUserWeeklyStanding } = require('../services/leaderboardService');
-const { rememberDeliveredMedia, deliverMedia, sendQueuedMessage } = require('../services/mediaService');
+const { sendQueuedMessage } = require('../services/mediaService');
 const { buildSubscriptionSummary } = require('../services/subscriptionService');
 const { mainUserKeyboard, startInlineKeyboard } = require('../keyboards/user');
 const { mainAdminKeyboard } = require('../keyboards/admin');
@@ -41,37 +39,17 @@ module.exports = (bot) => {
             await user.save();
 
             referrer.inviteCount += 1;
-            referrer.points = (referrer.points || 0) + 1;
             referrer.referralEvents.push({
               referredUserId: id,
               joinedAt: new Date(),
             });
-
-            // Check and award any newly unlocked referral tiers
-            const newTiers = checkAndAwardTiers(referrer);
             await referrer.save();
 
             const joinerName = first_name + (username ? ` (@${username})` : '');
-            const redeemable = Math.floor(referrer.points / POINTS_PER_MEDIA);
-
-            let refMsg =
+            const refMsg =
               `👥 *New referral!*\n${joinerName} joined using your link.\n\n` +
               `Total invites: *${referrer.inviteCount}*\n` +
-              `Points: *${referrer.points}* (${redeemable} media redeemable)`;
-
-            if (newTiers.length) {
-              const rewardCount = newTiers.reduce((sum, tier) => sum + tier.reward, 0);
-              const deliveredItems = await deliverMedia(ctx.telegram, referrerId, rewardCount, {
-                excludeIds: referrer.receivedMedia || [],
-              });
-
-              rememberDeliveredMedia(referrer, deliveredItems);
-              await referrer.save();
-
-              refMsg += '\n\n🎉 *Tier Unlocked!*\n' +
-                newTiers.map((t) => `${t.emoji} ${t.name}: +${t.reward} free videos`).join('\n') +
-                `\n\n🎬 Delivered now: *${deliveredItems.length}* bonus media item${deliveredItems.length !== 1 ? 's' : ''}.`;
-            }
+              `🏆 Weekly leaderboard tracking has been updated.`;
 
             sendQueuedMessage(ctx.telegram, referrerId, refMsg, { parse_mode: 'Markdown' }).catch(() => {});
           }
@@ -100,20 +78,22 @@ module.exports = (bot) => {
 
       const welcomeText =
         `❤️ Welcome to the Premium Video Club! 👋\n\n` +
-        `🔥 *Invite friends, earn rewards, and compete weekly!*\n\n` +
+        `🔥 *Invite friends and compete weekly!*\n\n` +
         `📊 *Your Account*\n` +
         `👥 Referrals: *${user.inviteCount || 0}*\n` +
         `🏆 Weekly Rank: *${weeklyRankText}*\n` +
         `💎 Membership: *${buildSubscriptionSummary(user.subscription)}*\n\n` +
-        `👥 *Referral Rewards:*\n${buildTiersList()}\n\n` +
         `🏆 *Weekly Championship*\n` +
         `🥇 #1 = 700 videos\n` +
-        `🥈 #2 = 600 videos\n` +
+        `   + Champion Badge (7 Days)\n` +
+        `� #2 = 600 videos\n` +
+        `   + Elite Badge (7 Days)\n` +
         `🥉 #3 = 500 videos\n` +
+        `   + Promoter Badge (7 Days)\n` +
         `🏅 #4-5 = 230 videos\n` +
         `🏅 #6-10 = 170 videos\n` +
         `🏅 #11-20 = 15 videos\n\n` +
-        `⭐ Start inviting and unlock your rewards! ⭐`;
+        `⭐ Start inviting and climb the leaderboard! ⭐`;
 
       await ctx.reply(welcomeText, {
         parse_mode: 'Markdown',

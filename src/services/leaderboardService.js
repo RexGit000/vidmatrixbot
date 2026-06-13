@@ -128,7 +128,7 @@ function buildWeeklyAnnouncement(entries, updatesChannelUsername) {
   return (
     `🏆 *WEEKLY REWARDS DISTRIBUTED* 🏆\n\n` +
     `🎉 Congratulations to all participants!\n` +
-    `✅ Weekly referral rewards have been distributed automatically.\n\n` +
+    `✅ Weekly leaderboard rewards have been distributed automatically.\n\n` +
     `${sections.join('\n')}\n\n` +
     `🚀 *A NEW WEEK HAS STARTED!*\n` +
     `Invite friends, climb the leaderboard, and win bigger rewards next week.\n\n` +

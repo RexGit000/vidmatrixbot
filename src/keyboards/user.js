@@ -1,5 +1,4 @@
 const { Markup } = require('telegraf');
-const { getNextTier } = require('../utils/referral');
 const { getSubscriptionDurationText } = require('../services/subscriptionService');
 
 function updatesChannelUrl(username) {
@@ -8,7 +7,7 @@ function updatesChannelUrl(username) {
 
 function packageButtonLabel(pkg) {
   if (pkg.type === 'subscription') {
-    return `👑 ${pkg.name} · ⭐ ${pkg.stars}/${getSubscriptionDurationText(pkg)} · 🎬 ${pkg.dailyMediaCount}/day`;
+    return `👑 ${pkg.name} · ⭐ ${pkg.stars} · ${getSubscriptionDurationText(pkg)} / ${pkg.dailyMediaCount} 🎬 per day`;
   }
 
   return `⭐ ${pkg.stars} Stars = ${pkg.mediaCount} Videos`;
@@ -27,14 +26,10 @@ function mainUserKeyboard(isAdmin = false) {
 // Uses background_color for Telegram Bot API colored button support.
 function startInlineKeyboard(user, packages, isAdmin, memberCount, updatesChannelUsername) {
   const inviteCount = user.inviteCount || 0;
-  const nextTier    = getNextTier(inviteCount);
-  const nextStr     = nextTier
-    ? `Next: ${nextTier.emoji} ${nextTier.name} (${inviteCount}/${nextTier.invites})`
-    : '🏆 Max Tier!';
 
   const rows = [];
 
-  rows.push([{ text: `👥 INVITE FRIENDS | ${nextStr}`,           callback_data: 'start_invite',   style: 'success' }]);
+  rows.push([{ text: `👥 INVITE FRIENDS | ${inviteCount} referrals`, callback_data: 'start_invite', style: 'success' }]);
   rows.push([{ text: `❤️ My Referral Progress (${inviteCount})`, callback_data: 'ref_progress',   style: 'danger'  }]);
 
   for (const pkg of packages) {
@@ -56,13 +51,9 @@ function startInlineKeyboard(user, packages, isAdmin, memberCount, updatesChanne
 // Transparent inline keyboard for the My Stats message (image-1 style).
 function statsInlineKeyboard(user, packages, isAdmin, memberCount, updatesChannelUsername) {
   const inviteCount = user.inviteCount || 0;
-  const nextTier    = getNextTier(inviteCount);
-  const nextStr     = nextTier
-    ? `${nextTier.emoji} ${nextTier.name} (${inviteCount}/${nextTier.invites})`
-    : '🏆 Max Tier!';
 
   const rows = [
-    [Markup.button.callback(`👥 INVITE FRIENDS | Next: ${nextStr}`, 'start_invite')],
+    [Markup.button.callback(`👥 INVITE FRIENDS | ${inviteCount} referrals`, 'start_invite')],
     [Markup.button.callback(`🏆 My Referral Progress (${inviteCount} invite${inviteCount !== 1 ? 's' : ''})`, 'ref_progress')],
   ];
 
