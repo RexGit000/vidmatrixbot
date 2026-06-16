@@ -86,7 +86,7 @@ module.exports = (bot) => {
         `🏆 *Weekly Championship*\n` +
         `🥇 #1 = 700 videos\n` +
         `   + Champion Badge (7 Days)\n` +
-        `� #2 = 600 videos\n` +
+        `🥈 #2 = 600 videos\n` +
         `   + Elite Badge (7 Days)\n` +
         `🥉 #3 = 500 videos\n` +
         `   + Promoter Badge (7 Days)\n` +

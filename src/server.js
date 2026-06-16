@@ -5,7 +5,6 @@ const Admin        = require('./models/Admin');
 const Settings     = require('./models/Settings');
 const adminCache   = require('./cache');
 const botState     = require('./services/botState');
-const bot          = require('./bot');
 const { syncMediaPool } = require('./services/syncService');
 const { runDailySubscriptionCycleIfNeeded } = require('./services/subscriptionService');
 const { runWeeklyCycleIfNeeded } = require('./services/weeklyCycleService');
@@ -39,9 +38,19 @@ app.use((err, _req, res, _next) => {
   res.status(500).json({ error: 'Internal server error' });
 });
 
+app.listen(PORT, () => console.log(`HTTP server listening on port ${PORT}`));
+
 // ── Boot ──────────────────────────────────────────────────────────────────────
 
+let booted = false;
+let bootTimer = null;
+let bot = null;
+
+process.once('SIGINT', () => bot?.stop('SIGINT'));
+process.once('SIGTERM', () => bot?.stop('SIGTERM'));
+
 async function boot() {
+  if (booted) return;
   try {
     await connectDB();
 
@@ -56,9 +65,8 @@ async function boot() {
     const savedBotState = await Settings.get('botEnabled');
     botState.set(savedBotState !== false);
     console.log(`Bot state: ${botState.get() ? 'enabled' : 'disabled'}`);
-
-    // Start Express
-    app.listen(PORT, () => console.log(`HTTP server listening on port ${PORT}`));
+    
+    bot = require('./bot');
 
     // Verify token + get bot identity (plain API call, works before launch)
     const me = await bot.telegram.getMe();
@@ -98,16 +106,20 @@ async function boot() {
       runScheduledJobs().catch((err) => console.error('[schedule] periodic run failed:', err));
     }, SCHEDULE_INTERVAL_MS);
 
-    // Graceful shutdown
-    process.once('SIGINT',  () => bot.stop('SIGINT'));
-    process.once('SIGTERM', () => bot.stop('SIGTERM'));
-
     // Start long-polling — promise never resolves (infinite loop), so don't await
     bot.launch().catch((err) => {
       if (err?.message !== 'Aborted') console.error('[bot]', err);
     });
+
+    booted = true;
   } catch (err) {
-    console.error('[boot error]', err.message);
+    console.error('[boot error]', err);
+    if (!bootTimer) {
+      bootTimer = setTimeout(() => {
+        bootTimer = null;
+        boot().catch(() => {});
+      }, 5000);
+    }
   }
 }
 
