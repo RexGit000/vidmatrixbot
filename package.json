@@ -1,0 +1,20 @@
+{
+  "name": "vidmatrix",
+  "version": "1.0.0",
+  "description": "Telegram Stars Media Delivery Bot",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "seed": "node src/seed.js",
+    "seed:admins": "node src/seed.js --admins-only",
+    "test:weekly-broadcast": "node src/scripts/testWeeklyBroadcast.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "mongoose": "^8.4.0",
+    "queue-promise": "^2.2.1",
+    "telegraf": "^4.16.3"
+  }
+}
