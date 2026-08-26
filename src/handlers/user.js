@@ -2,6 +2,7 @@ const { Markup } = require('telegraf');
 const User    = require('../models/User');
 const Media   = require('../models/Media');
 const Package = require('../models/Package');
+const Order   = require('../models/Order');
 const Settings = require('../models/Settings');
 const adminCache = require('../cache');
 const { POINTS_PER_MEDIA } = require('../constants');
@@ -313,21 +314,53 @@ module.exports = (bot) => {
       await ctx.answerCbQuery();
       const pkg = await Package.findById(ctx.match[1]);
       if (!pkg) { await ctx.answerCbQuery('Package not found.', true); return; }
-      await ctx.replyWithInvoice({
-        title:          pkg.type === 'subscription' ? `${pkg.name} Subscription` : `${pkg.mediaCount} Media Pack`,
-        description:    pkg.type === 'subscription'
-          ? `${getSubscriptionDurationText(pkg)} / ${pkg.dailyMediaCount} media per day.`
-          : `Get ${pkg.mediaCount} exclusive media items instantly!`,
-        payload:        `${pkg.type === 'subscription' ? 'sub' : 'pkg'}:${pkg._id}`,
-        currency:       'XTR',
-        prices:         [{ label: pkg.name, amount: pkg.stars }],
-        provider_token: '',
+
+      const isSub = pkg.type === 'subscription';
+      const mediaCount = isSub ? (pkg.dailyMediaCount || 0) : pkg.mediaCount;
+      const title = isSub ? `${pkg.name} Subscription` : `${pkg.mediaCount} Media Pack`;
+      const desc = isSub
+        ? `${getSubscriptionDurationText(pkg)} / ${pkg.dailyMediaCount} media per day.`
+        : `Get ${pkg.mediaCount} exclusive media items instantly!`;
+
+      const order = await Order.create({
+        userId: ctx.from.id,
+        chatId: ctx.chat.id,
+        packageId: pkg._id,
+        amount: pkg.stars,
+        mediaCount: mediaCount,
+        packageName: pkg.name,
       });
+
+      const botUsername = ctx.botInfo.username;
+      const deepLinkPayload = `${botUsername}_${order.paymentToken}`;
+      const paymentLink = `https://t.me/rexpaymentbot?start=${deepLinkPayload}`;
+
+      const sent = await ctx.reply(
+        `📦 *${title}*\n\n` +
+        `${desc}\n\n` +
+        `💰 Price: *${pkg.stars} Stars* ⭐\n\n` +
+        `🔗 Click the button below to complete payment securely via our Payment Bot.`,
+        {
+          parse_mode: 'Markdown',
+          ...Markup.inlineKeyboard([
+            [Markup.button.url(`💳 Pay ${pkg.stars} Stars via Payment Bot`, paymentLink)],
+            [Markup.button.callback('✖ Cancel', 'cancel_payment_link')],
+          ]),
+        }
+      );
+
+      order.paymentLinkMsgId = sent.message_id;
+      await order.save();
     } catch (err) {
       if (err?.response?.error_code === 403) return;
       console.error('[buy pkg]', err.message);
-      await ctx.reply('Could not create invoice. Try again.').catch(() => {});
+      await ctx.reply('Could not create payment link. Try again.').catch(() => {});
     }
+  });
+
+  bot.action('cancel_payment_link', async (ctx) => {
+    await ctx.answerCbQuery();
+    await ctx.deleteMessage().catch(() => {});
   });
 
   // ── Back to main (from packages keyboard) ─────────────────────────────────

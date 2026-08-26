@@ -79,6 +79,7 @@ const SEED_SETTINGS = [
   { key: "referralRewardAmount", value: 3 },
   { key: "subscriptionCycleLastRunDayKey", value: null },
   { key: "weeklyRewardsLastProcessedWeekKey", value: null },
+  { key: "botEnabled", value: true },
 ];
 
 async function seedAdmins() {
@@ -109,6 +110,16 @@ async function seedAdmins() {
       console.log(`Updated admin: ${data.telegramId ?? data.username}`);
     } else {
       console.log(`Admin already exists: ${data.telegramId ?? data.username}`);
+    }
+  }
+
+  for (const data of SEED_SETTINGS) {
+    const existing = await Settings.findOne({ key: data.key });
+    if (!existing) {
+      await Settings.create(data);
+      if (data.value !== null) {
+        console.log(`Seeded setting: ${data.key} = ${data.value}`);
+      }
     }
   }
 }
