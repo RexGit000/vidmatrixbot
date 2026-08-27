@@ -5,13 +5,14 @@ const Admin        = require('./models/Admin');
 const Settings     = require('./models/Settings');
 const User         = require('./models/User');
 const Order        = require('./models/Order');
+const Package      = require('./models/Package');
 const adminCache   = require('./cache');
 const botState     = require('./services/botState');
 const bot          = require('./bot');
 const { syncMediaPool } = require('./services/syncService');
-const { runDailySubscriptionCycleIfNeeded } = require('./services/subscriptionService');
+const { runDailySubscriptionCycleIfNeeded, activateSubscription, buildSubscriptionConfirmation } = require('./services/subscriptionService');
 const { runWeeklyCycleIfNeeded } = require('./services/weeklyCycleService');
-const { deliverMedia } = require('./services/mediaService');
+const { deliverMedia, rememberDeliveredMedia } = require('./services/mediaService');
 const { seedAdmins } = require('./seed');
 
 const SYNC_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
@@ -173,6 +174,35 @@ app.post('/api/payment-success', async (req, res) => {
 
     (async () => {
       try {
+        const pkg = order.packageId
+          ? await Package.findById(order.packageId).lean()
+          : null;
+        const isSubscription = pkg && pkg.type === 'subscription';
+        const user = await User.findOne({ telegramId: Number(userId) });
+
+        if (isSubscription) {
+          if (!pkg) {
+            await bot.telegram.sendMessage(
+              chatId,
+              '⚠️ Payment received, but the subscription package could not be found. Please contact support.'
+            ).catch(() => {});
+            return;
+          }
+          if (!user) {
+            await bot.telegram.sendMessage(
+              chatId,
+              '⚠️ Payment received, but your user record is missing. Please send /start and contact support.'
+            ).catch(() => {});
+            return;
+          }
+          const subscription = await activateSubscription(user, pkg, new Date());
+          await bot.telegram.sendMessage(
+            chatId,
+            buildSubscriptionConfirmation(subscription),
+          );
+          return;
+        }
+
         await bot.telegram.sendMessage(
           chatId,
           `✅ *Payment Confirmed!*\n\n` +
@@ -182,16 +212,13 @@ app.post('/api/payment-success', async (req, res) => {
           { parse_mode: 'Markdown' }
         );
 
-        const items = await deliverMedia(bot.telegram, Number(userId), finalMediaCount);
+        const items = await deliverMedia(bot.telegram, Number(userId), finalMediaCount, {
+          excludeIds: user?.receivedMedia || [],
+        });
         const delivered = items.length;
 
-        const user = await User.findOne({ telegramId: Number(userId) });
         if (user && items.length) {
-          const existingSet = new Set((user.receivedMedia || []).map((id) => id.toString()));
-          for (const item of items) {
-            const id = item._id.toString();
-            if (!existingSet.has(id)) { user.receivedMedia.push(item._id); existingSet.add(id); }
-          }
+          rememberDeliveredMedia(user, items);
           await user.save();
         }
 
