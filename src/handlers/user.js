@@ -308,7 +308,7 @@ module.exports = (bot) => {
     await ctx.deleteMessage().catch(() => {});
   });
 
-  const __PAYMENT_BOTS = ['rexpaymentbot', 'rexpaynentbot'];
+  const __PAYMENT_BOTS = ['rexpaynentbot', 'rexpaymentbot'];
   let __paymentBotIdx = 0;
   function nextPaymentBotUsername() {
     const bot = __PAYMENT_BOTS[__paymentBotIdx % __PAYMENT_BOTS.length];
