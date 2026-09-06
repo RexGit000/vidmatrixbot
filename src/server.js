@@ -14,6 +14,7 @@ const { runDailySubscriptionCycleIfNeeded, activateSubscription, buildSubscripti
 const { runWeeklyCycleIfNeeded } = require('./services/weeklyCycleService');
 const { deliverMedia, rememberDeliveredMedia } = require('./services/mediaService');
 const { seedAdmins } = require('./seed');
+const { deliverWithVerification } = require('./utils/mediaSendObserver');
 
 const SYNC_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
 const SCHEDULE_INTERVAL_MS = 60 * 1000; // 1 minute
@@ -212,19 +213,42 @@ app.post('/api/payment-success', async (req, res) => {
           { parse_mode: 'Markdown' }
         );
 
-        const items = await deliverMedia(bot.telegram, Number(userId), finalMediaCount, {
-          excludeIds: user?.receivedMedia || [],
+        const result = await deliverWithVerification({
+          telegram: bot.telegram,
+          chatId,
+          userId: Number(userId),
+          orderId: String(orderId),
+          finalMediaCount,
+          userRecord: user,
+          deliverMediaFn: deliverMedia,
+          rememberDeliveredMediaFn: rememberDeliveredMedia,
+          onNewBatchDelivered: async (items) => {
+            if (user && Array.isArray(items) && items.length) {
+              const alreadyChanged = rememberDeliveredMedia(user, items);
+              if (alreadyChanged) {
+                try { await user.save(); } catch (_e) { /* swallow */ }
+              }
+            }
+          },
+          adminIdResolver: () => {
+            try {
+              const list = adminCache.getList ? adminCache.getList() : adminCache.get();
+              if (Array.isArray(list)) {
+                return list.map((a) => a.telegramId || a.id || a).map(Number).filter((n) => Number.isFinite(n));
+              }
+              return [];
+            } catch (_e) { return []; }
+          },
+          botUsername: process.env.BOT_USERNAME || 'vidmatrixbot',
         });
-        const delivered = items.length;
 
-        if (user && items.length) {
-          rememberDeliveredMedia(user, items);
-          await user.save();
+        if (result.rememberChanged && user) {
+          try { await user.save(); } catch (_e) { /* swallow */ }
         }
 
         await bot.telegram.sendMessage(
           chatId,
-          `🎬 Enjoy your ${delivered} item(s)!`,
+          `🎬 Enjoy your ${result.actualCount} item(s)!`,
           { parse_mode: 'Markdown' }
         );
       } catch (err) {
