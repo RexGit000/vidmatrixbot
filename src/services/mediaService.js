@@ -45,6 +45,15 @@ function isBadFileIdentifierError(err) {
   );
 }
 
+function unwrapQueueResult(v) {
+  if (v instanceof Error) throw v;
+  if (Array.isArray(v)) {
+    const err = v.find((x) => x instanceof Error);
+    if (err) throw err;
+  }
+  return v;
+}
+
 async function deliverMedia(telegram, chatId, count, { excludeIds = [] } = {}) {
   const delivered = [];
   const usedIds = new Set(excludeIds.map((id) => id.toString()));
@@ -71,7 +80,7 @@ async function deliverMedia(telegram, chatId, count, { excludeIds = [] } = {}) {
       if (usedIds.has(itemId)) continue;
 
       try {
-        await enqueue(async () => {
+        unwrapQueueResult(await enqueue(async () => {
           await withRetry(async () => {
             if (item.fileType === 'photo') {
               await telegram.sendPhoto(chatId, item.fileId);
@@ -79,7 +88,7 @@ async function deliverMedia(telegram, chatId, count, { excludeIds = [] } = {}) {
               await telegram.sendVideo(chatId, item.fileId);
             }
           });
-        });
+        }));
 
         delivered.push(item);
         usedIds.add(itemId);
@@ -122,7 +131,7 @@ function rememberDeliveredMedia(user, items) {
 }
 
 async function sendQueuedMessage(telegram, chatId, text, extra = {}) {
-  return enqueue(async () => {
+  const r = await enqueue(async () => {
     try {
       await withRetry(async () => {
         await telegram.sendMessage(chatId, text, extra);
@@ -136,6 +145,13 @@ async function sendQueuedMessage(telegram, chatId, text, extra = {}) {
       throw err;
     }
   });
+  if (r instanceof Error) throw r;
+  if (Array.isArray(r)) {
+    const err = r.find((x) => x instanceof Error);
+    if (err) throw err;
+    return Array.isArray(r) ? r[r.length - 1] : r;
+  }
+  return r;
 }
 
 module.exports = { deliverMedia, rememberDeliveredMedia, sendQueuedMessage, withRetry, isSkippableTelegramError, isBadFileIdentifierError };
