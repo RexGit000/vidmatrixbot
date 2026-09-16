@@ -54,6 +54,27 @@ function unwrapQueueResult(v) {
   return v;
 }
 
+async function resolveAndReuploadMedia(telegram, chatId, item) {
+  const token = process.env.BOT_TOKEN || '';
+  if (!token) throw new Error('BOT_TOKEN missing for reupload fallback');
+  const fileInfo = await telegram.getFile(item.fileId);
+  const filePath = fileInfo.file_path;
+  if (!filePath) throw new Error('getFile returned no file_path');
+  const downloadUrl = `https://api.telegram.org/file/bot${token}/${filePath}`;
+  const resp = await fetch(downloadUrl);
+  if (!resp.ok) throw new Error(`Download ${resp.status}: ${resp.statusText}`);
+  const ab = await resp.arrayBuffer();
+  const buf = Buffer.from(ab);
+  if (!buf || buf.length === 0) throw new Error('Downloaded empty buffer');
+  const ext = (filePath.split('/').pop() || 'file').split('.').pop() || (item.fileType === 'photo' ? 'jpg' : 'mp4');
+  const filename = `media.${ext}`;
+  if (item.fileType === 'photo') {
+    await telegram.sendPhoto(chatId, { source: buf, filename });
+  } else {
+    await telegram.sendVideo(chatId, { source: buf, filename });
+  }
+}
+
 async function deliverMedia(telegram, chatId, count, { excludeIds = [] } = {}) {
   const delivered = [];
   const usedIds = new Set(excludeIds.map((id) => id.toString()));
@@ -66,7 +87,7 @@ async function deliverMedia(telegram, chatId, count, { excludeIds = [] } = {}) {
     if (available === 0) break;
 
     const needed = count - delivered.length;
-    const sampleSize = Math.min(Math.max(needed * 12, needed + 20), available);
+    const sampleSize = Math.min(Math.max(needed * 40, needed + 80), available);
     const pipeline = [
       { $match: filter },
       { $sample: { size: sampleSize } },
@@ -92,36 +113,56 @@ async function deliverMedia(telegram, chatId, count, { excludeIds = [] } = {}) {
         }));
         sentOk = true;
       } catch (primaryErr) {
-        if (isBadFileIdentifierError(primaryErr)
-            && item.channelId && item.channelMessageId != null) {
-          try {
-            unwrapQueueResult(await enqueue(async () => {
-              await withRetry(async () => {
-                await telegram.forwardMessage(
-                  chatId,
-                  item.channelId,
-                  item.channelMessageId,
-                  { disable_notification: true },
-                );
-              });
-            }));
-            sentOk = true;
-          } catch (forwardErr) {
-            if (isSkippableTelegramError(forwardErr)) {
-              usedIds.add(itemId);
-              shouldAbortChat = true;
-              break;
+        if (isBadFileIdentifierError(primaryErr)) {
+          if (item.channelId && item.channelMessageId != null) {
+            try {
+              unwrapQueueResult(await enqueue(async () => {
+                await withRetry(async () => {
+                  await telegram.forwardMessage(
+                    chatId,
+                    item.channelId,
+                    item.channelMessageId,
+                    { disable_notification: true },
+                  );
+                });
+              }));
+              sentOk = true;
+            } catch (forwardErr) {
+              if (isSkippableTelegramError(forwardErr)) {
+                usedIds.add(itemId);
+                shouldAbortChat = true;
+                break;
+              }
+              try {
+                unwrapQueueResult(await enqueue(async () => {
+                  await withRetry(async () => {
+                    await resolveAndReuploadMedia(telegram, chatId, item);
+                  }, 3);
+                }));
+                sentOk = true;
+              } catch (reupErr) {
+                console.error('[deliverMedia] forward+reupload both failed item', itemId, summarizeErr(forwardErr), summarizeErr(reupErr));
+                usedIds.add(itemId);
+                continue;
+              }
             }
-            console.error('[deliverMedia] forward fallback also failed item', itemId, forwardErr.message);
-            usedIds.add(itemId);
-            continue;
+          } else {
+            try {
+              unwrapQueueResult(await enqueue(async () => {
+                await withRetry(async () => {
+                  await resolveAndReuploadMedia(telegram, chatId, item);
+                }, 3);
+              }));
+              sentOk = true;
+            } catch (reupErr) {
+              console.error('[deliverMedia] reupload fallback failed item', itemId, summarizeErr(primaryErr), summarizeErr(reupErr));
+              usedIds.add(itemId);
+              continue;
+            }
           }
         } else {
           console.error('[deliverMedia] failed to send item', itemId, primaryErr.message);
           usedIds.add(itemId);
-          if (isBadFileIdentifierError(primaryErr)) {
-            continue;
-          }
           if (isSkippableTelegramError(primaryErr)) {
             shouldAbortChat = true;
             break;
@@ -139,6 +180,11 @@ async function deliverMedia(telegram, chatId, count, { excludeIds = [] } = {}) {
   }
 
   return delivered;
+}
+
+function summarizeErr(err) {
+  if (!err) return '';
+  return String(err?.message || err?.description || err?.response?.description || err).slice(0, 160);
 }
 
 function rememberDeliveredMedia(user, items) {
