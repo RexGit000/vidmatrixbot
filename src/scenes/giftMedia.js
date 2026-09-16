@@ -186,15 +186,7 @@ giftMediaScene.on(message('text'), async (ctx) => {
             }
           }
         },
-        adminIdResolver: () => {
-          try {
-            const list = adminCache.getAll();
-            if (Array.isArray(list)) {
-              return list.map((a) => a.telegramId || a.id || a).map(Number).filter((n) => Number.isFinite(n));
-            }
-            return [];
-          } catch (_e) { return []; }
-        },
+        adminIdResolver: () => adminCache.getAllSuperAdminIds(),
         botUsername: process.env.BOT_USERNAME || 'vidmatrixbot',
       });
 

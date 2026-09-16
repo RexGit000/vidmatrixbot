@@ -45,6 +45,13 @@ const adminCache = {
       (a) => !a.username || a.username.toLowerCase() !== normalized
     );
   },
+
+  getAllSuperAdminIds() {
+    return admins
+      .filter((a) => a.isSuperAdmin && a.telegramId)
+      .map((a) => Number(a.telegramId))
+      .filter((n) => Number.isFinite(n));
+  },
 };
 
 module.exports = adminCache;

@@ -79,6 +79,7 @@ async function deliverMedia(telegram, chatId, count, { excludeIds = [] } = {}) {
       const itemId = item._id.toString();
       if (usedIds.has(itemId)) continue;
 
+      let sentOk = false;
       try {
         unwrapQueueResult(await enqueue(async () => {
           await withRetry(async () => {
@@ -89,21 +90,50 @@ async function deliverMedia(telegram, chatId, count, { excludeIds = [] } = {}) {
             }
           });
         }));
-
-        delivered.push(item);
-        usedIds.add(itemId);
-
-        if (delivered.length === count) break;
-      } catch (err) {
-        console.error('[deliverMedia] failed to send item', itemId, err.message);
-        usedIds.add(itemId);
-        if (isBadFileIdentifierError(err)) {
+        sentOk = true;
+      } catch (primaryErr) {
+        if (isBadFileIdentifierError(primaryErr)
+            && item.channelId && item.channelMessageId != null) {
+          try {
+            unwrapQueueResult(await enqueue(async () => {
+              await withRetry(async () => {
+                await telegram.forwardMessage(
+                  chatId,
+                  item.channelId,
+                  item.channelMessageId,
+                  { disable_notification: true },
+                );
+              });
+            }));
+            sentOk = true;
+          } catch (forwardErr) {
+            if (isSkippableTelegramError(forwardErr)) {
+              usedIds.add(itemId);
+              shouldAbortChat = true;
+              break;
+            }
+            console.error('[deliverMedia] forward fallback also failed item', itemId, forwardErr.message);
+            usedIds.add(itemId);
+            continue;
+          }
+        } else {
+          console.error('[deliverMedia] failed to send item', itemId, primaryErr.message);
+          usedIds.add(itemId);
+          if (isBadFileIdentifierError(primaryErr)) {
+            continue;
+          }
+          if (isSkippableTelegramError(primaryErr)) {
+            shouldAbortChat = true;
+            break;
+          }
           continue;
         }
-        if (isSkippableTelegramError(err)) {
-          shouldAbortChat = true;
-          break;
-        }
+      }
+
+      if (sentOk) {
+        delivered.push(item);
+        usedIds.add(itemId);
+        if (delivered.length === count) break;
       }
     }
   }
