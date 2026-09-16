@@ -39,4 +39,16 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-module.exports = { parseAdminInput, getMessageType, formatDate, sleep };
+function formatCompactNumber(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return String(value);
+  const sign = n < 0 ? '-' : '';
+  const abs = Math.abs(n);
+  if (abs < 1000) return `${sign}${abs}`;
+  const k = abs / 1000;
+  const rounded = Math.round(k * 10) / 10;
+  const str = Number.isInteger(rounded) ? String(rounded) : String(rounded);
+  return `${sign}${str}k`;
+}
+
+module.exports = { parseAdminInput, getMessageType, formatDate, sleep, formatCompactNumber };
