@@ -1,8 +1,7 @@
 const Media    = require('../models/Media');
 const Settings = require('../models/Settings');
 const { adminCache } = require('../cache');
-const { enqueueNotify, enqueueAdrelay } = require('../services/queue');
-const { mirrorChannelPost } = require('../services/advertisedRelay');
+const { enqueueNotify } = require('../services/queue');
 
 const BOT_KEY = String(process.env.CURRENT_BOT_KEY || (process.env.BOT_TOKEN || '').split(':')[0] || 'default').trim();
 
@@ -90,8 +89,6 @@ module.exports = (bot) => {
         }
       }
       if (!updated) return;
-
-      mirrorChannelPost(bot.telegram, { channelId, messageId: post.message_id }, enqueueAdrelay);
 
       const total = await Media.countDocuments().catch(() => 0);
 
