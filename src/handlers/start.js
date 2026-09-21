@@ -1,7 +1,7 @@
 const User    = require('../models/User');
 const Package = require('../models/Package');
 const Settings = require('../models/Settings');
-const adminCache = require('../cache');
+const { adminCache } = require('../cache');
 const { getUserWeeklyStanding } = require('../services/leaderboardService');
 const { sendQueuedMessage } = require('../services/mediaService');
 const { buildSubscriptionSummary } = require('../services/subscriptionService');

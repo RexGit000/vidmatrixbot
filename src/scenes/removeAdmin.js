@@ -1,6 +1,6 @@
 const { Scenes, Markup } = require('telegraf');
 const Admin = require('../models/Admin');
-const adminCache = require('../cache');
+const { adminCache } = require('../cache');
 const { enqueue } = require('../services/queue');
 const { mainAdminKeyboard } = require('../keyboards/admin');
 

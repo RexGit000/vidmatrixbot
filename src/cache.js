@@ -1,4 +1,5 @@
-// In-memory admin cache — reloaded on every server start
+const { LRUCache } = require('lru-cache');
+
 let admins = [];
 
 const adminCache = {
@@ -54,4 +55,10 @@ const adminCache = {
   },
 };
 
-module.exports = adminCache;
+const deliveryCache = new LRUCache({
+  max: 2000,
+  ttl: 1000 * 60 * 60 * 4,
+  updateAgeOnGet: true,
+});
+
+module.exports = { adminCache, deliveryCache };

@@ -1,5 +1,5 @@
 const Admin = require('../models/Admin');
-const adminCache = require('../cache');
+const { adminCache } = require('../cache');
 
 module.exports = async (ctx, next) => {
   if (!ctx.from) return next();

@@ -1,7 +1,7 @@
 const { Scenes, Markup } = require('telegraf');
 const { message } = require('telegraf/filters');
 const Admin = require('../models/Admin');
-const adminCache = require('../cache');
+const { adminCache } = require('../cache');
 const { parseAdminInput } = require('../utils/helpers');
 const { enqueue } = require('../services/queue');
 const { mainAdminKeyboard } = require('../keyboards/admin');

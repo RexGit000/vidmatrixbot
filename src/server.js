@@ -1,12 +1,14 @@
 require('dotenv').config({ override: true });
 const express  = require('express');
 const connectDB    = require('./db');
+require('./models/Media');
+require('./models/UserbotAccount');
 const Admin        = require('./models/Admin');
 const Settings     = require('./models/Settings');
 const User         = require('./models/User');
 const Order        = require('./models/Order');
 const Package      = require('./models/Package');
-const adminCache   = require('./cache');
+const { adminCache } = require('./cache');
 const botState     = require('./services/botState');
 const bot          = require('./bot');
 const { syncMediaPool } = require('./services/syncService');

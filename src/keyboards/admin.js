@@ -9,6 +9,7 @@ function mainAdminKeyboard() {
     ['📺 File Channel',     '📢 Updates Channel'],
     ['📋 User List',        '🎁 Gift Media'],
     [toggleBtn],
+    ['🤖 Userbot Login'],
     ['👤 Switch to User View'],
   ]).resize();
 }

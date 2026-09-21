@@ -1,49 +1,8 @@
 const Media    = require('../models/Media');
 const User     = require('../models/User');
 const Settings = require('../models/Settings');
-const adminCache = require('../cache');
-const fs = require('fs');
-const http = require('http');
-
-let syncing = false;
-let syncPending = false;
-
-function getDebugConfig() {
-  const fallback = { url: null, sessionId: null };
-  if (process.env.DEBUG_SERVER_URL && process.env.DEBUG_SESSION_ID) {
-    return { url: process.env.DEBUG_SERVER_URL, sessionId: process.env.DEBUG_SESSION_ID };
-  }
-  try {
-    const p = '.dbg/bandwidth-memory-spike.env';
-    const raw = fs.readFileSync(p, 'utf8');
-    const url = raw.match(/DEBUG_SERVER_URL=(.+)/)?.[1]?.trim() || null;
-    const sessionId = raw.match(/DEBUG_SESSION_ID=(.+)/)?.[1]?.trim() || null;
-    return { url, sessionId };
-  } catch {
-    return fallback;
-  }
-}
-
-function reportDebugEvent(evt) {
-  try {
-    const { url, sessionId } = getDebugConfig();
-    if (!url || !sessionId) return;
-    const u = new URL(url);
-    const body = JSON.stringify({ ts: Date.now(), sessionId, ...evt });
-    const req = http.request(
-      {
-        hostname: u.hostname,
-        port: u.port || 80,
-        path: u.pathname,
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
-      },
-      (res) => res.resume()
-    );
-    req.on('error', () => {});
-    req.end(body);
-  } catch {}
-}
+const { adminCache } = require('../cache');
+const { sleep } = require('../utils/helpers');
 
 async function checkChannelAccess(bot) {
   const channelId = await Settings.get('fileManagerChannel');
@@ -64,94 +23,20 @@ async function checkChannelAccess(bot) {
   }
 }
 
-async function syncMediaPoolOnce(bot) {
+async function syncMediaPool(bot) {
   await checkChannelAccess(bot);
 
-  const startedAt = Date.now();
-  // #region debug-point A:sync-start
-  reportDebugEvent({ runId: 'pre', hypothesisId: 'A', location: 'syncService.js:syncMediaPool', msg: '[DEBUG] syncMediaPool start', data: { rss: process.memoryUsage().rss, heapUsed: process.memoryUsage().heapUsed } });
-  // #endregion
-
-  const cursor = Media.find({}, { _id: 1, fileId: 1 }).lean().cursor();
-  const stale = [];
-  let total = 0;
-  let checked = 0;
-  let failures = 0;
-
-  const MAX_CONCURRENCY = 10;
-  const inflight = new Set();
-
-  const checkOne = async (m) => {
-    try {
-      await bot.telegram.getFile(m.fileId);
-      checked += 1;
-    } catch {
-      failures += 1;
-      stale.push(m._id);
-    }
-  };
-
-  for await (const m of cursor) {
-    total += 1;
-    let p;
-    p = checkOne(m).finally(() => inflight.delete(p));
-    inflight.add(p);
-    if (inflight.size >= MAX_CONCURRENCY) {
-      await Promise.race(inflight);
-    }
-  }
-
-  if (inflight.size) {
-    await Promise.allSettled(Array.from(inflight));
-  }
-
+  const total = await Media.countDocuments();
   if (!total) {
     console.log('[sync] Media pool is empty, nothing to check');
     return;
   }
 
-  console.log(`[sync] Checked ${total} media record(s)...`);
+  const BOT_KEY = String(process.env.CURRENT_BOT_KEY || (process.env.BOT_TOKEN || '').split(':')[0] || 'default').trim();
+  const seeded = await Media.countDocuments({ [`bot_file_ids.${BOT_KEY}`]: { $exists: true, $ne: null } });
+  const needCold = total - seeded;
 
-  if (!stale.length) {
-    console.log('[sync] All media accessible — pool is clean');
-    return;
-  }
-
-  const failRate = stale.length / total;
-  if (failRate > 0.2) {
-    console.warn(`[sync] ${stale.length}/${total} files failed (${Math.round(failRate * 100)}%) — looks like a token or connectivity issue, skipping deletion to avoid data loss`);
-    return;
-  }
-
-  await Media.deleteMany({ _id: { $in: stale } });
-  await User.updateMany(
-    { receivedMedia: { $in: stale } },
-    { $pull: { receivedMedia: { $in: stale } } }
-  );
-
-  console.log(`[sync] Removed ${stale.length} inaccessible record(s) and cleared from user history`);
-
-  // #region debug-point A:sync-end
-  reportDebugEvent({ runId: 'pre', hypothesisId: 'A', location: 'syncService.js:syncMediaPool', msg: '[DEBUG] syncMediaPool end', data: { total, checked, failures, staleCount: stale.length, ms: Date.now() - startedAt, rss: process.memoryUsage().rss, heapUsed: process.memoryUsage().heapUsed } });
-  // #endregion
-}
-
-async function syncMediaPool(bot) {
-  if (syncing) {
-    syncPending = true;
-    return;
-  }
-
-  syncing = true;
-  try {
-    await syncMediaPoolOnce(bot);
-  } finally {
-    syncing = false;
-    if (syncPending) {
-      syncPending = false;
-      await syncMediaPool(bot);
-    }
-  }
+  console.log(`[sync] ${total} media record(s); BOT_KEY=${BOT_KEY} — seeded=${seeded}, will-cold-reseed-on-first-redemption=${needCold}`);
 }
 
 module.exports = { syncMediaPool };

@@ -3,7 +3,7 @@ const User     = require('../models/User');
 const Media    = require('../models/Media');
 const Package  = require('../models/Package');
 const Settings = require('../models/Settings');
-const adminCache = require('../cache');
+const { adminCache } = require('../cache');
 const botState = require('../services/botState');
 const { mainUserKeyboard, startInlineKeyboard } = require('../keyboards/user');
 const { mainAdminKeyboard, mediaManageKeyboard, adminManageKeyboard } = require('../keyboards/admin');
@@ -11,6 +11,7 @@ const { formatDate } = require('../utils/helpers');
 const { POINTS_PER_MEDIA } = require('../constants');
 const { buildSubscriptionSummary } = require('../services/subscriptionService');
 const { getUserWeeklyStanding } = require('../services/leaderboardService');
+const { listLoggedInAccounts } = require('../bot/userbotLogin');
 
 const MEDIA_PAGE_SIZE = 5;
 const USER_PAGE_SIZE  = 10;
@@ -67,6 +68,43 @@ module.exports = (bot) => {
   bot.hears('🎁 Gift Media', async (ctx) => {
     if (!adminGuard(ctx)) return;
     return ctx.scene.enter('GIFT_MEDIA');
+  });
+
+  // ── Userbot Login ─────────────────────────────────────────────────────
+  bot.hears('🤖 Userbot Login', async (ctx) => {
+    if (!adminGuard(ctx)) return;
+    try {
+      const hasCreds = process.env.API_ID && process.env.API_HASH;
+      const inlineRows = [
+        [Markup.button.callback('➕ Add Userbot Session', 'userbot_add')],
+        [Markup.button.callback('👁 List Sessions', 'userbot_list')],
+      ];
+      let msg = '🤖 *Userbot Login*\n\n';
+      if (!hasCreds) {
+        msg += '⚠️ _Warning: API_ID and API_HASH are not set in .env — userbot login will fail until configured._\n\n';
+      }
+      msg += 'Add or review userbot sessions (used as Tier-3 delivery fallback).';
+      await ctx.reply(msg, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(inlineRows) });
+    } catch (err) {
+      if (err?.response?.error_code === 403) return;
+      console.error('[userbot login menu]', err.message);
+    }
+  });
+
+  bot.action('userbot_add', async (ctx) => {
+    if (!adminGuard(ctx)) return;
+    await ctx.answerCbQuery().catch(() => {});
+    return ctx.scene.enter('USERBOT_LOGIN');
+  });
+
+  bot.action('userbot_list', async (ctx) => {
+    if (!adminGuard(ctx)) return;
+    await ctx.answerCbQuery().catch(() => {});
+    try {
+      await listLoggedInAccounts(bot, ctx.chat.id);
+    } catch (err) {
+      console.error('[userbot list]', err.message);
+    }
   });
 
   // ── Switch to User View ───────────────────────────────────────────────────
@@ -158,7 +196,7 @@ module.exports = (bot) => {
       const safePage   = Math.min(page, totalPages - 1);
 
       const items = await Media.find()
-        .sort({ addedAt: -1 })
+        .sort({ last_seen_at: -1 })
         .skip(safePage * MEDIA_PAGE_SIZE)
         .limit(MEDIA_PAGE_SIZE)
         .lean();
@@ -169,8 +207,8 @@ module.exports = (bot) => {
       }
 
       const rows = items.map((m) => {
-        const emoji = m.fileType === 'photo' ? '📷' : '🎬';
-        const label = `${emoji} ${formatDate(m.addedAt)}`;
+        const emoji = (m.metadata?.kind === 'photo' ? '📷' : (m.metadata?.kind === 'video' ? '🎬' : (m.metadata?.kind === 'document' ? '📄' : '📦')));
+        const label = `${emoji} ${formatDate(m.metadata?.uploaded_at || m.last_seen_at || m.createdAt || new Date())}`;
         return [Markup.button.callback(label, `media_del_confirm:${m._id}`)];
       });
 
