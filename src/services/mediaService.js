@@ -3,7 +3,7 @@ const Media = require('../models/Media');
 const UserbotAccount = require('../models/UserbotAccount');
 const Settings = require('../models/Settings');
 const { deliveryCache } = require('../cache');
-const { enqueue } = require('./queue');
+const { enqueueDeliver } = require('./queue');
 
 const BOT_KEY = String(process.env.CURRENT_BOT_KEY || (process.env.BOT_TOKEN || '').split(':')[0] || 'default').trim();
 
@@ -90,7 +90,7 @@ async function hotSendMedia(telegram, chatId, row, replyToMessageId) {
     const baseExtra = {};
     if (replyToMessageId) baseExtra.reply_to_message_id = replyToMessageId;
 
-    unwrapQueueResult(await enqueue(async () => {
+    unwrapQueueResult(await enqueueDeliver(async () => {
       await withRetry(async () => {
         if (kind === 'photo') {
           await telegram.sendPhoto(chatId, fid, baseExtra);
@@ -168,7 +168,7 @@ async function coldForwardAndSeed(telegram, chatId, row, replyToMessageId, fileM
     let lastError = null;
     let msg = null;
     try {
-      unwrapQueueResult(await enqueue(async () => {
+      unwrapQueueResult(await enqueueDeliver(async () => {
         await withRetry(async () => {
           msg = await telegram.copyMessage(chatId, row.source.channel_id, row.source.message_id, extra);
         });
@@ -179,7 +179,7 @@ async function coldForwardAndSeed(telegram, chatId, row, replyToMessageId, fileM
         return { ok: false, reason: 'chat_skippable', error: forwardErr, skippable: true };
       }
       try {
-        unwrapQueueResult(await enqueue(async () => {
+        unwrapQueueResult(await enqueueDeliver(async () => {
           await withRetry(async () => {
             msg = await telegram.forwardMessage(chatId, row.source.channel_id, row.source.message_id, extra);
           });

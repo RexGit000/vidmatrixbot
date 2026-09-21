@@ -16,7 +16,27 @@ function setSession(userId, data) { userSessions.set(String(userId), data); }
 function clearSession(userId) { userSessions.delete(String(userId)); }
 function getAuthClient(adminId) { return authClients.get(String(adminId)) || null; }
 function setAuthClient(adminId, client) { authClients.set(String(adminId), client); }
-function clearAuthClient(adminId) { authClients.delete(String(adminId)); }
+function clearAuthClient(adminId) {
+  const userId = String(adminId);
+  const c = authClients.get(userId);
+  authClients.delete(userId);
+  return c || null;
+}
+
+async function destroyClient(client, userId) {
+  if (!client) return;
+  if (userId) clearAuthClient(userId);
+  try {
+    if (typeof client.removeEventHandler === 'function') {
+      try { client.removeEventHandler(); } catch (_) { /* ignore */ }
+    }
+    client.setLogLevel?.('fatal');
+  } catch (_) { /* ignore */ }
+  try {
+    await client.disconnect?.()?.catch?.(() => {});
+    try { await client.destroy?.()?.catch?.(() => {}); } catch (_) { /* ignore */ }
+  } catch (_) { /* ignore */ }
+}
 
 async function withTimeout(promise, ms, label = 'timeout') {
   let t = null;
@@ -48,8 +68,7 @@ async function handleCancel(ctx) {
   const userId = String(ctx.from?.id || '');
   const client = userId ? getAuthClient(userId) : null;
   clearSession(ctx.from?.id);
-  if (userId) clearAuthClient(userId);
-  try { if (client) await client.disconnect().catch(() => {}); } catch {}
+  if (client) await destroyClient(client, userId);
   try { await ctx.answerCbQuery && await ctx.answerCbQuery().catch(() => {}); } catch {}
   try {
     await ctx.reply('Canceled.', require('../keyboards/admin').mainAdminKeyboard()).catch(async () => {
@@ -79,26 +98,34 @@ async function handlePhoneNumber(ctx, session) {
 
   const fp = randomFingerprint();
   let client = new TelegramClient(new StringSession(''), Number(process.env.API_ID), process.env.API_HASH, {
-    useWSS: false,
-    autoReconnect: true,
-    timeout: 30000,
-    requestRetries: 3,
-    connectionRetries: 5,
+    useWSS: true,
+    autoReconnect: false,
+    timeout: 20000,
+    requestRetries: 1,
+    connectionRetries: 2,
+    retryDelay: 1000,
     deviceModel: fp.deviceModel,
     systemVersion: fp.systemVersion,
     appVersion: fp.appVersion,
     langCode: fp.langCode,
     systemLangCode: fp.systemLangCode,
   });
+  client.setLogLevel?.('warn');
+  try {
+    if (typeof client.on === 'function') {
+      client.on('error', () => {});
+    }
+  } catch (_) { /* ignore */ }
   if (userId) setAuthClient(userId, client);
 
   try {
-    await withTimeout(client.connect(), 45_000, 'login_connect_timeout');
-    const result = await withTimeout(sendCodeWithRetry(client, phone), 60_000, 'login_send_code_timeout');
+    await withTimeout(client.connect(), 30_000, 'login_connect_timeout');
+    const result = await withTimeout(sendCodeWithRetry(client, phone), 45_000, 'login_send_code_timeout');
     if (!result.success) throw new Error(result.error || 'failed');
     if (result.client && result.client !== client) {
-      try { await client.disconnect().catch(() => {}); } catch {}
+      await destroyClient(client, userId);
       client = result.client;
+      try { client.setLogLevel?.('warn'); } catch (_) { /* ignore */ }
       if (userId) setAuthClient(userId, client);
     }
     session.data = { ...session.data, phoneNumber: phone, phoneCodeHash: result.phoneCodeHash };
@@ -107,8 +134,7 @@ async function handlePhoneNumber(ctx, session) {
     return ctx.reply('Code sent. Enter verification code:', cancelKeyboard()).catch(() => {});
   } catch (err) {
     clearSession(ctx.from.id);
-    if (userId) clearAuthClient(userId);
-    try { await client?.disconnect?.().catch(() => {}); } catch {}
+    await destroyClient(client, userId);
     return ctx.reply(`Login failed: ${String(err.message || err)}`, cancelKeyboard()).catch(() => {});
   }
 }
@@ -117,15 +143,14 @@ async function saveNewAccount(ctx, phoneNumber, client) {
   clearSession(ctx.from.id);
   let me = null;
   let sessionString = '';
+  const userId = String(ctx.from?.id || '');
   try {
-    me = await client.getMe();
+    me = await withTimeout(client.getMe(), 25_000, 'get_me_timeout');
     sessionString = client.session.save();
   } catch (err) {
     throw new Error(`Account read failed: ${String(err.message || err)}`);
   } finally {
-    try { await client.disconnect().catch(() => {}); } catch {}
-    const userId = String(ctx.from?.id || '');
-    if (userId) clearAuthClient(userId);
+    await destroyClient(client, userId);
   }
   const prior = await UserbotAccount.findOne({
     $or: [{ number: phoneNumber }, me?.username ? { username: me.username } : { _id: null }],
@@ -167,8 +192,12 @@ async function handleVerificationCode(ctx, session) {
   if (!client) { clearSession(ctx.from.id); return ctx.reply('Session expired. Start again.', cancelKeyboard()).catch(() => {}); }
   await ctx.reply('Logging in...').catch(() => {});
   try {
-    if (!client.connected) await withTimeout(client.connect(), 45_000, 'login_connect_timeout');
-    await client.invoke(new Api.auth.SignIn({ phoneNumber, phoneCodeHash, phoneCode: code }));
+    if (!client.connected) await withTimeout(client.connect(), 30_000, 'login_connect_timeout');
+    await withTimeout(
+      client.invoke(new Api.auth.SignIn({ phoneNumber, phoneCodeHash, phoneCode: code })),
+      30_000,
+      'sign_in_timeout'
+    );
     await saveNewAccount(ctx, phoneNumber, client);
   } catch (err) {
     const codeMsg = String(err.code === 401 ? (err.errorMessage || '') : '');
@@ -178,8 +207,7 @@ async function handleVerificationCode(ctx, session) {
       return ctx.reply('2FA enabled. Send password:', cancelKeyboard()).catch(() => {});
     }
     clearSession(ctx.from.id);
-    if (userId) clearAuthClient(userId);
-    try { await client?.disconnect?.().catch(() => {}); } catch {}
+    await destroyClient(client, userId);
     return ctx.reply(`Login failed: ${String(err.message || err)}`, cancelKeyboard()).catch(() => {});
   }
 }
@@ -192,19 +220,22 @@ async function handlePassword(ctx, session) {
   if (!client) { clearSession(ctx.from.id); return ctx.reply('Session expired. Start again.', cancelKeyboard()).catch(() => {}); }
   await ctx.reply('Verifying password...').catch(() => {});
   try {
-    if (!client.connected) await withTimeout(client.connect(), 45_000, 'login_connect_timeout');
-    const passwordInfo = await client.invoke(new Api.account.GetPassword());
+    if (!client.connected) await withTimeout(client.connect(), 30_000, 'login_connect_timeout');
+    const passwordInfo = await withTimeout(client.invoke(new Api.account.GetPassword()), 30_000, 'get_password_timeout');
     const { computeCheck } = await import('telegram/Password.js');
     const passwordHash = await computeCheck(passwordInfo, password);
-    await client.invoke(new Api.auth.CheckPassword({ password: passwordHash }));
+    await withTimeout(
+      client.invoke(new Api.auth.CheckPassword({ password: passwordHash })),
+      30_000,
+      'check_password_timeout'
+    );
     await saveNewAccount(ctx, phoneNumber, client);
   } catch (err) {
     if (String(err.errorMessage || '').includes('PASSWORD_HASH_INVALID')) {
       return ctx.reply('Wrong password. Try again:', cancelKeyboard()).catch(() => {});
     }
     clearSession(ctx.from.id);
-    if (userId) clearAuthClient(userId);
-    try { await client?.disconnect?.().catch(() => {}); } catch {}
+    await destroyClient(client, userId);
     return ctx.reply(`Login failed: ${String(err.message || err)}`, cancelKeyboard()).catch(() => {});
   }
 }

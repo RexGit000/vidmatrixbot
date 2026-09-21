@@ -1,7 +1,7 @@
 const Media    = require('../models/Media');
 const Settings = require('../models/Settings');
 const { adminCache } = require('../cache');
-const { enqueue } = require('../services/queue');
+const { enqueueNotify, enqueueAdrelay } = require('../services/queue');
 const { mirrorChannelPost } = require('../services/advertisedRelay');
 
 const BOT_KEY = String(process.env.CURRENT_BOT_KEY || (process.env.BOT_TOKEN || '').split(':')[0] || 'default').trim();
@@ -42,30 +42,58 @@ module.exports = (bot) => {
       }
 
       const uploaded_at = post.date ? new Date(post.date * 1000) : new Date();
+      const captureKey  = `${channelId}:${post.message_id}`;
 
       const bot_file_ids = {};
       bot_file_ids[BOT_KEY] = fileId;
 
-      const doc = await Media.create({
-        source: {
-          channel_id: channelId,
-          message_id: post.message_id,
-        },
-        metadata: {
-          kind: fileType,
-          mime_type,
-          file_name,
-          file_size,
-          uploaded_at,
-        },
-        bot_file_ids,
-        file_unique_id: file_unique_id || undefined,
+      const $set = {
+        'metadata.kind': fileType,
+        'metadata.mime_type': mime_type,
+        'metadata.file_name': file_name,
+        'metadata.file_size': file_size,
+        'metadata.uploaded_at': uploaded_at,
+        [`bot_file_ids.${BOT_KEY}`]: fileId,
         last_seen_at: new Date(),
-      });
+      };
+      if (file_unique_id) $set.file_unique_id = file_unique_id;
 
-      mirrorChannelPost(bot.telegram, { channelId, messageId: post.message_id });
+      let updated = null;
+      try {
+        updated = await Media.findOneAndUpdate(
+          { capture_key: captureKey },
+          {
+            $set,
+            $setOnInsert: {
+              source: { channel_id: channelId, message_id: post.message_id },
+              capture_key: captureKey,
+            },
+          },
+          { upsert: true, new: true, runValidators: true, context: 'query' }
+        ).lean();
+      } catch (err) {
+        if (err && err.code === 11000) {
+          try {
+            updated = await Media.findOne({ capture_key: captureKey }).lean();
+            if (updated) {
+              await Media.updateOne({ _id: updated._id }, {
+                $set: {
+                  [`bot_file_ids.${BOT_KEY}`]: fileId,
+                  last_seen_at: new Date(),
+                },
+              });
+            }
+          } catch (_) { /* ignore */ }
+        } else {
+          console.error('[channel_post] capture write failed:', err.message);
+          return;
+        }
+      }
+      if (!updated) return;
 
-      const total = await Media.countDocuments();
+      mirrorChannelPost(bot.telegram, { channelId, messageId: post.message_id }, enqueueAdrelay);
+
+      const total = await Media.countDocuments().catch(() => 0);
 
       const emojiMap = { photo: '📷', video: '🎬', document: '📄' };
       const emoji = emojiMap[fileType] || '📦';
@@ -73,9 +101,9 @@ module.exports = (bot) => {
 
       const admins = adminCache.getAll().filter((a) => a.telegramId);
       for (const admin of admins) {
-        enqueue(async () => {
+        enqueueNotify(async () => {
           try {
-            await bot.telegram.sendMessage(admin.telegramId, msg);
+            await bot.telegram.sendMessage(admin.telegramId, msg, { disable_notification: true });
           } catch { /* ignore unreachable admins */ }
         });
       }

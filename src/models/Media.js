@@ -38,10 +38,18 @@ const mediaSchema = new mongoose.Schema(
     file_unique_id: { type: String, default: undefined },
     mtproto: { type: mtprotoSchema, default: null },
     last_seen_at: { type: Date, default: Date.now },
+    capture_key: { type: String, required: true, sparse: true, unique: true },
   },
   { timestamps: true }
 );
 
+mediaSchema.pre('validate', function (next) {
+  if (!this.source || !this.source.channel_id || this.source.message_id == null) return next();
+  this.capture_key = `${this.source.channel_id}:${this.source.message_id}`;
+  next();
+});
+
+mediaSchema.index({ capture_key: 1 }, { unique: true });
 mediaSchema.index({ 'source.channel_id': 1, 'source.message_id': 1 }, { unique: true });
 mediaSchema.index({ file_unique_id: 1 }, { unique: true, sparse: true });
 mediaSchema.index({ 'mtproto.id': 1 }, { unique: true, sparse: true });

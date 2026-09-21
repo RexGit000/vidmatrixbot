@@ -47,20 +47,39 @@ function onQueueReject(label) {
   };
 }
 
-// Main queue for single-user API calls (media delivery, admin notifications)
+const deliverQueue = new Queue({
+  concurrent: 2,
+  interval: 250,
+  start: true,
+});
+
+const notifyQueue = new Queue({
+  concurrent: 3,
+  interval: 150,
+  start: true,
+});
+
+const adrelayQueue = new Queue({
+  concurrent: 4,
+  interval: 100,
+  start: true,
+});
+
 const tgQueue = new Queue({
   concurrent: 1,
-  interval: 500,  // 2 requests per second to the same user
+  interval: 500,
   start: true,
 });
 
-// Separate queue for broadcasts — slightly higher concurrency
 const broadcastQueue = new Queue({
   concurrent: 3,
-  interval: 200,  // 15 messages per second for broadcasts
+  interval: 200,
   start: true,
 });
 
+deliverQueue.on('reject', onQueueReject('deliverQueue'));
+notifyQueue.on('reject', onQueueReject('notifyQueue'));
+adrelayQueue.on('reject', onQueueReject('adrelayQueue'));
 tgQueue.on('reject', onQueueReject('tgQueue'));
 broadcastQueue.on('reject', onQueueReject('broadcastQueue'));
 
@@ -68,8 +87,31 @@ function enqueue(fn) {
   return tgQueue.enqueue(fn);
 }
 
+function enqueueDeliver(fn) {
+  return deliverQueue.enqueue(fn);
+}
+
+function enqueueNotify(fn) {
+  return notifyQueue.enqueue(fn);
+}
+
+function enqueueAdrelay(fn) {
+  return adrelayQueue.enqueue(fn);
+}
+
 function enqueueBroadcast(fn) {
   return broadcastQueue.enqueue(fn);
 }
 
-module.exports = { enqueue, enqueueBroadcast, tgQueue, broadcastQueue };
+module.exports = {
+  enqueue,
+  enqueueDeliver,
+  enqueueNotify,
+  enqueueAdrelay,
+  enqueueBroadcast,
+  tgQueue,
+  deliverQueue,
+  notifyQueue,
+  adrelayQueue,
+  broadcastQueue,
+};
