@@ -125,22 +125,72 @@ async function getUserbotEntitySafe(userbotClient, channelIdAny, chatIdAny) {
   return null;
 }
 
+const channelEntityLRU = new LRUCache({ max: 200, ttl: 5 * 60 * 1000 });
+
+async function resolveUserbotEntityOnce(userbotClient, channelIdAny) {
+  if (!userbotClient || !channelIdAny) return null;
+  const cacheKey = String(channelIdAny);
+  if (channelEntityLRU.has(cacheKey)) {
+    const v = channelEntityLRU.get(cacheKey);
+    return v || null;
+  }
+  const tryList = [];
+  const digOnly = String(cacheKey).replace(/[^0-9]/g, '');
+  if (digOnly) {
+    const abs = digOnly.startsWith('100') ? digOnly.slice(3) : digOnly;
+    const clean = Number(BigInt.asIntN(64, BigInt(abs)));
+    for (const prefix of ['-100', '-', '']) {
+      const v = Number(prefix + abs);
+      if (!Number.isNaN(v) && Number.isFinite(v)) tryList.push(v);
+    }
+    if (clean !== Number(abs)) tryList.push(clean);
+    tryList.push(Number(cacheKey));
+  } else {
+    tryList.push(cacheKey);
+  }
+  const uniq = [];
+  for (const c of tryList) {
+    if (!uniq.includes(String(c))) uniq.push(String(c));
+  }
+  let out = null;
+  for (const candidate of uniq) {
+    for (const fn of [
+      (c) => userbotClient.getEntity(c),
+      (c) => userbotClient.getInputEntity(c),
+    ]) {
+      try {
+        const got = await Promise.race([
+          Promise.resolve(fn(candidate)),
+          new Promise((_res, rej) => setTimeout(() => rej(new Error('entity_resolve_timeout')), 6000)),
+        ]);
+        if (got) { out = got; break; }
+      } catch (_e) { /* try next */ }
+    }
+    if (out) break;
+  }
+  if (out) {
+    channelEntityLRU.set(cacheKey, out);
+    return out;
+  } else {
+    channelEntityLRU.set(cacheKey, false);
+    return null;
+  }
+}
+
 async function uploadFileViaUserbot(userbotClient, row, chatId) {
   if (!row || !row.source || !row.source.channel_id || !row.source.message_id) return null;
   let fromEntity = null;
   let toEntity = null;
   try {
-    const e1 = await getUserbotEntitySafe(userbotClient, row.source.channel_id, chatId);
-    if (!e1) return null;
-    fromEntity = e1.entity;
+    fromEntity = await resolveUserbotEntityOnce(userbotClient, row.source.channel_id);
+    if (!fromEntity) return null;
   } catch (e) {
     console.warn('[userbot] source resolve err:', String(e.message || e).slice(0, 180));
     return null;
   }
   try {
-    const e2 = await getUserbotEntitySafe(userbotClient, chatId, null);
-    if (!e2) return null;
-    toEntity = e2.entity;
+    toEntity = await resolveUserbotEntityOnce(userbotClient, chatId);
+    if (!toEntity) return null;
   } catch (e) {
     console.warn('[userbot] target resolve err:', String(e.message || e).slice(0, 180));
     return null;
@@ -149,9 +199,12 @@ async function uploadFileViaUserbot(userbotClient, row, chatId) {
     const msgId = Number(row.source.message_id);
     let fetchedMsg = null;
     const fetchAttempts = [
-      async () => { const m = await userbotClient.getMessages(fromEntity, { ids: [msgId], limit: 1 }); return m && m.length ? m[0] : null; },
       async () => {
-        const iter = await userbotClient.getHistory(fromEntity, { limit: 10 });
+        const m = await userbotClient.getMessages(fromEntity, { ids: [msgId], limit: 1 });
+        return m && m.length ? m[0] : null;
+      },
+      async () => {
+        const iter = await userbotClient.getHistory(fromEntity, { limit: 30 });
         const arr = Array.isArray(iter) ? iter : (iter && Array.isArray(iter.messages) ? iter.messages : null);
         if (!arr) return null;
         return arr.find(m => Number(m.id) === msgId) || null;
@@ -398,13 +451,46 @@ function extractFileIdFromSentMessage(msg) {
   return null;
 }
 
+const siblingByCaptureLRU = new LRUCache({ max: 2000, ttl: 10 * 60 * 1000 });
+async function findAccessibleSiblingMedia(row, fileManagerChannelId) {
+  if (!row || !fileManagerChannelId) return null;
+  const ck = String(row.capture_key || '');
+  const srcCh = String(row.source?.channel_id || '');
+  const fmc = String(fileManagerChannelId);
+  if (ck && srcCh !== fmc) {
+    const cacheKey = `sib:${ck}`;
+    const cached = siblingByCaptureLRU.peek(cacheKey);
+    if (cached !== undefined) return cached || null;
+    const sib = await Media.findOne({
+      capture_key: ck,
+      'source.channel_id': fmc,
+      'source.message_id': { $exists: true, $ne: null },
+    }).select('_id source capture_key bot_file_ids metadata').lean();
+    if (sib) {
+      siblingByCaptureLRU.set(cacheKey, sib);
+      return sib;
+    } else {
+      siblingByCaptureLRU.set(cacheKey, false);
+    }
+  }
+  return null;
+}
+
 async function coldForwardAndSeed(telegram, chatId, row, replyToMessageId, fileManagerChannelId) {
   try {
     if (!row || !row.source || !row.source.channel_id || !row.source.message_id) {
       return { ok: false, reason: 'missing_source' };
     }
+    let actualRow = row;
+    let siblingMode = false;
     if (fileManagerChannelId != null && String(row.source.channel_id) !== String(fileManagerChannelId)) {
-      return { ok: false, reason: 'channel_unapproved' };
+      const sibling = await findAccessibleSiblingMedia(row, fileManagerChannelId);
+      if (sibling && sibling.source && sibling.source.channel_id && sibling.source.message_id) {
+        actualRow = sibling;
+        siblingMode = true;
+      } else {
+        return { ok: false, reason: 'channel_unapproved' };
+      }
     }
     const extra = replyToMessageId
       ? { reply_to_message_id: replyToMessageId, disable_notification: true }
@@ -416,10 +502,10 @@ async function coldForwardAndSeed(telegram, chatId, row, replyToMessageId, fileM
       await withHardTimeout((async () => {
         unwrapQueueResult(await enqueueDeliver(async () => {
           await withRetry(async () => {
-            msg = await telegram.copyMessage(chatId, row.source.channel_id, row.source.message_id, extra);
+            msg = await telegram.copyMessage(chatId, actualRow.source.channel_id, actualRow.source.message_id, extra);
           }, 3, COLD_COPY_HARD_TIMEOUT_MS);
         }));
-      })(), `cold_copy_${row.source.channel_id}_${row.source.message_id}_${chatId}`, COLD_COPY_HARD_TIMEOUT_MS + 8000);
+      })(), `cold_copy_${actualRow.source.channel_id}_${actualRow.source.message_id}_${chatId}`, COLD_COPY_HARD_TIMEOUT_MS + 8000);
     } catch (forwardErr) {
       lastError = forwardErr;
       if (isSkippableTelegramError(forwardErr)) {
@@ -524,6 +610,26 @@ async function deliverMedia(telegram, chatId, count, { excludeIds = [], onProgre
 
   const userbotClient = await getUserbotClient().catch(() => null);
   const userbotAvailable = !!userbotClient;
+
+  async function resolveBestRowForDelivery(candidateMediaRow) {
+    if (!candidateMediaRow || !fileManagerChannelId) return candidateMediaRow;
+    const srcCh = String(candidateMediaRow.source?.channel_id || '');
+    if (srcCh === String(fileManagerChannelId)) return candidateMediaRow;
+    const hasFmc = candidateMediaRow.bot_file_ids && candidateMediaRow.bot_file_ids[BOT_KEY];
+    if (hasFmc) return candidateMediaRow;
+    try {
+      const sib = await findAccessibleSiblingMedia(candidateMediaRow, fileManagerChannelId);
+      if (sib && sib.source && sib.source.channel_id && sib.source.message_id != null) {
+        candidateMediaRow = Object.assign({}, candidateMediaRow, {
+          source: Object.assign({}, sib.source),
+          bot_file_ids: Object.assign({}, candidateMediaRow.bot_file_ids || {}, (sib.bot_file_ids || {})),
+          metadata: Object.assign({}, candidateMediaRow.metadata || {}, (sib.metadata || {})),
+          _deliverySiblingOf: candidateMediaRow._id,
+        });
+      }
+    } catch (_e) {}
+    return candidateMediaRow;
+  }
 
   function emitProgress(eventName, payload) {
     if (!onProgressFn) return;
@@ -641,7 +747,8 @@ async function deliverMedia(telegram, chatId, count, { excludeIds = [], onProgre
     while (cursor < candidates.length && delivered.length < TARGET && !quitOuter && !shouldAbortChat) {
       const batch = candidates.slice(cursor, cursor + PARALLEL_BATCH_SIZE);
       cursor += batch.length;
-      const results = await Promise.all(batch.map(it => deliverOne(it)));
+      const resolved = await Promise.all(batch.map(it => resolveBestRowForDelivery(it)));
+      const results = await Promise.all(resolved.map(it => deliverOne(it)));
       for (const r of results) {
         if (r.skippable) { quitOuter = true; }
       }
