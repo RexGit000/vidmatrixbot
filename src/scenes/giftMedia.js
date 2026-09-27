@@ -170,10 +170,18 @@ giftMediaScene.on(message('text'), async (ctx) => {
     }
 
     ctx.scene.state.step = 'delivering';
-    let result = null;
-    const hold = await ctx.reply('⏳ Preparing delivery… please wait.');
+    let holdMessageId = null;
+    try {
+      const hold = await ctx.reply('⏳ Preparing delivery… please wait.');
+      holdMessageId = hold?.message_id ?? null;
+    } catch (_errHold) {
+      console.warn('[giftMedia] hold reply failed, continuing silently:', _errHold.message);
+    }
 
     (async () => {
+      let result = null;
+      let fatalErr = null;
+      const name = [user.firstName, user.lastName].filter(Boolean).join(' ') || 'Unknown';
       try {
         result = await deliverWithVerification({
           telegram: ctx.telegram,
@@ -188,7 +196,6 @@ giftMediaScene.on(message('text'), async (ctx) => {
 
         const promised = result.promised;
         const actual = result.actualCount;
-        const shortfall = result.shortfall;
 
         if (actual > 0 && actual === promised) {
           try {
@@ -198,12 +205,21 @@ giftMediaScene.on(message('text'), async (ctx) => {
               `${actual} media ${verb} gifted to you by the admin, Enjoy🎉`
             );
           } catch (err) {
-            console.error('[giftMedia] Failed to notify user:', err.message);
+            console.error('[giftMedia] Failed to notify target user:', err.message);
           }
         }
+      } catch (err) {
+        fatalErr = err;
+        console.error('[giftMedia] deliverWithVerification fatal:', err?.stack || String(err));
+      }
 
-        const name = [user.firstName, user.lastName].filter(Boolean).join(' ') || 'Unknown';
-        let reply;
+      let reply;
+      if (fatalErr) {
+        reply = `❌ Gift delivery failed (internal error). ${fatalErr.message ? 'Error: ' + String(fatalErr.message).slice(0, 300) : ''}`;
+      } else {
+        const promised = result.promised;
+        const actual = result.actualCount;
+        const shortfall = result.shortfall;
         if (shortfall > 0) {
           reply =
             `⚠️ Gift had shortfall\nRequested: ${formatCompactNumber(promised)}\nDelivered: ${formatCompactNumber(actual)}\nShortfall: ${shortfall}\nUser NOT notified (shortfall gate).\nTarget: ${name}${user.username ? ` (@${user.username})` : ''}`;
@@ -214,17 +230,26 @@ giftMediaScene.on(message('text'), async (ctx) => {
           reply =
             `✅ Gift sent!\nDelivered ${formatCompactNumber(actual)} / ${formatCompactNumber(promised)} media items to ${name}${user.username ? ` (@${user.username})` : ''}`;
         }
-        try { await ctx.deleteMessage(hold.message_id).catch(() => {}); } catch (_e) {}
-        await ctx.reply(reply, { ...mainAdminKeyboard() });
-        return ctx.scene.leave();
-      } catch (err) {
-        console.error('[giftMedia]', err);
-        try { await ctx.deleteMessage(hold.message_id).catch(() => {}); } catch (_e) {}
-        await ctx.reply('❌ Failed to deliver media. Check logs.', { ...mainAdminKeyboard() });
-        return ctx.scene.leave();
       }
+
+      if (holdMessageId != null) {
+        try { await ctx.deleteMessage(holdMessageId); } catch (_e) {}
+      }
+      try {
+        await ctx.reply(reply, { ...mainAdminKeyboard() });
+      } catch (replyErr) {
+        console.error('[giftMedia] final admin reply failed:', replyErr.message);
+      }
+      try { ctx.scene.leave(); } catch (_e) {}
     })().catch((e) => {
-      console.error('[giftMedia] async delivery wrapper uncaught:', e);
+      console.error('[giftMedia] IIFE outer catch:', e?.stack || String(e));
+      if (holdMessageId != null) {
+        try { ctx.deleteMessage(holdMessageId).catch(() => {}); } catch (_e2) {}
+      }
+      try {
+        ctx.reply('❌ Gift failed. Check logs.', { ...mainAdminKeyboard() }).catch(() => {});
+      } catch (_e3) {}
+      try { ctx.scene.leave(); } catch (_e4) {}
     });
     return;
   }
