@@ -178,31 +178,28 @@ giftMediaScene.on(message('text'), async (ctx) => {
     ctx.scene.state.step = 'delivering';
     let holdMessageId = null;
     try {
-      const hold = await ctx.reply(`⏳ Preparing delivery of ${formatCompactNumber(count)} items… please wait.`);
+      const hold = await ctx.reply(`⏳ Preparing ${count} gift item${count === 1 ? '' : 's'} for ${nameCompact(user)}…`);
       holdMessageId = hold?.message_id ?? null;
     } catch (_errHold) {
       console.warn('[giftMedia] hold reply failed:', _errHold.message);
     }
 
-    const progressThrottleMs = 4000;
+    const progressThrottleMs = 5000;
     let lastProgressAt = 0;
     let lastProgressDelivered = -1;
 
-    async function updateHoldProgress({ delivered, target, tierCounts, elapsedMs }) {
+    async function updateHoldProgress({ delivered, target, elapsedMs }) {
       if (holdMessageId == null) return;
       const now = Date.now();
       if (delivered === lastProgressDelivered && (now - lastProgressAt) < progressThrottleMs) return;
       lastProgressAt = now;
       lastProgressDelivered = delivered;
-      const tier = [];
-      if (tierCounts?.hot > 0) tier.push(`hot=${tierCounts.hot}`);
-      if (tierCounts?.userbot > 0) tier.push(`ub=${tierCounts.userbot}`);
-      if (tierCounts?.cold > 0) tier.push(`cold=${tierCounts.cold}`);
-      const tierLine = tier.length ? ` [${tier.join(',')}]` : '';
       const sec = Math.round(Number(elapsedMs || 0) / 1000);
+      const targetText = target ? ` / ${target}` : '';
       const text =
-        `⏳ Delivered ${formatCompactNumber(delivered)} / ${formatCompactNumber(target)} … running … ${sec}s elapsed${tierLine}\n` +
-        `(Target: ${nameCompact(user)})`;
+        `⏳ Gift in progress… ${delivered}${targetText} sent` +
+        (sec >= 10 ? ` (${sec}s so far)` : '') +
+        `\nTo: ${nameCompact(user)}`;
       try {
         await ctx.telegram.editMessageText(ctx.chat.id, holdMessageId, null, text).catch(() => {});
       } catch (_e) {}
@@ -223,7 +220,7 @@ giftMediaScene.on(message('text'), async (ctx) => {
             if (!combinedOpts.onProgress) {
               combinedOpts.onProgress = function onProgress(ev, info) {
                 if (ev !== 'batch' && ev !== 'begin' && ev !== 'end') return;
-                try { updateHoldProgress({ delivered: info.delivered || 0, target: info.target || n, tierCounts: info.tierCounts, elapsedMs: info.elapsedMs || 0 }); } catch (_e) {}
+                try { updateHoldProgress({ delivered: info.delivered || 0, target: info.target || n, elapsedMs: info.elapsedMs || 0 }); } catch (_e) {}
               };
             }
             return deliverMedia(tg, tgt, n, combinedOpts);
@@ -236,8 +233,7 @@ giftMediaScene.on(message('text'), async (ctx) => {
         const actual = result.actualCount;
         if (actual > 0 && actual === promised) {
           try {
-            const verb = actual === 1 ? 'was' : 'were';
-            await ctx.telegram.sendMessage(user.telegramId, `${actual} media ${verb} gifted to you by the admin, Enjoy🎉`);
+            await ctx.telegram.sendMessage(user.telegramId, `🎁 You just got ${actual} gifted media from the admin — enjoy!`);
           } catch (err) {
             console.error('[giftMedia] Failed to notify target user:', err.message);
           }
@@ -249,22 +245,26 @@ giftMediaScene.on(message('text'), async (ctx) => {
 
       let reply;
       if (fatalErr) {
-        reply = `❌ Gift delivery failed (internal error). ${fatalErr.message ? 'Error: ' + String(fatalErr.message).slice(0, 300) : ''}`;
+        reply = `❌ Gift failed to send. ${fatalErr.message ? 'Error: ' + String(fatalErr.message).slice(0, 220) : ''}`;
       } else {
         const promised = result.promised;
         const actual = result.actualCount;
         const shortfall = result.shortfall;
-        const attempts = result.attempts;
-        const extra = result.attempts > 1 ? ` (Tried ${attempts} times: 1 initial + ${attempts - 1} top-ups.)` : '';
         if (shortfall > 0) {
           reply =
-            `⚠️ Gift had shortfall\nRequested: ${formatCompactNumber(promised)}\nDelivered: ${formatCompactNumber(actual)}\nShortfall: ${shortfall}${extra}\nUser NOT notified (shortfall gate).\nTarget: ${nameCompact(user)}`;
+            `⚠️ Not enough media in the pool to fill this gift.\n` +
+            `Asked for ${promised} but only ${actual} were available.\n` +
+            `(${shortfall} missing. We did NOT message the user.)\n` +
+            `To: ${nameCompact(user)}`;
         } else if (actual === 0) {
           reply =
-            `❌ Gift delivered zero media items.${extra}\nRequested: ${formatCompactNumber(promised)}\nTarget: ${nameCompact(user)}`;
+            `⚠️ Couldn't send any gift media right now.\n` +
+            `Asked for ${promised} but 0 were delivered.\n` +
+            `To: ${nameCompact(user)}`;
         } else {
           reply =
-            `✅ Gift sent!${extra}\nDelivered ${formatCompactNumber(actual)} / ${formatCompactNumber(promised)} media items to ${nameCompact(user)}`;
+            `✅ Gift sent.\n` +
+            `${actual} of ${promised} delivered to ${nameCompact(user)}.`;
         }
       }
 
