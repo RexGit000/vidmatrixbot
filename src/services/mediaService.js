@@ -461,12 +461,16 @@ async function findAccessibleSiblingMedia(row, fileManagerChannelId) {
     const cacheKey = `sib:${ck}`;
     const cached = siblingByCaptureLRU.peek(cacheKey);
     if (cached !== undefined) return cached || null;
-    const sib = await Media.findOne({
-      capture_key: ck,
-      'source.channel_id': fmc,
-      'source.message_id': { $exists: true, $ne: null },
-    }).select('_id source capture_key bot_file_ids metadata').lean();
-    if (sib) {
+    const queries = [{ capture_key: ck, 'source.channel_id': fmc, 'source.message_id': { $exists: true, $ne: null } }];
+    if (row.file_unique_id) queries.unshift({ file_unique_id: row.file_unique_id, 'source.channel_id': fmc, 'source.message_id': { $exists: true, $ne: null } });
+    let sib = null;
+    for (const q of queries) {
+      try {
+        sib = await Media.findOne(q).select('_id source capture_key bot_file_ids metadata file_unique_id').lean();
+        if (sib && sib.source && sib.source.channel_id && sib.source.message_id != null) break;
+      } catch (_e) { sib = null; }
+    }
+    if (sib && sib.source && sib.source.channel_id && sib.source.message_id != null) {
       siblingByCaptureLRU.set(cacheKey, sib);
       return sib;
     } else {
@@ -726,34 +730,93 @@ async function deliverMedia(telegram, chatId, count, { excludeIds = [], onProgre
     }
   }
 
-  while (delivered.length < TARGET && !shouldAbortChat) {
-    const filter = { _id: { $nin: Array.from(usedIds) } };
-    const available = await Media.countDocuments(filter);
-    if (available === 0) break;
-    if (hardFailStreak >= HARD_FAIL_ABORT_STREAK) {
-      console.error(`[delivery] bail after ${hardFailStreak} consecutive hard-fails streak; total fails=${hardFailTotal}; returning ${delivered.length}/${TARGET} chat=${chatId}`);
-      break;
-    }
-    if (hardFailTotal >= HARD_FAIL_ABORT_TOTAL) {
-      console.error(`[delivery] bail after ${hardFailTotal} cumulative hard-fails; returning ${delivered.length}/${TARGET} chat=${chatId}`);
-      break;
-    }
-    const remaining = TARGET - delivered.length;
-    const sampleSize = Math.min(Math.max(remaining * SAMPLING_MAX_MULT, remaining + SAMPLING_MIN), available);
-    const candidates = await Media.aggregate([{ $match: filter }, { $sample: { size: sampleSize } }]);
-    if (!candidates.length) break;
-    let cursor = 0;
-    let quitOuter = false;
-    while (cursor < candidates.length && delivered.length < TARGET && !quitOuter && !shouldAbortChat) {
-      const batch = candidates.slice(cursor, cursor + PARALLEL_BATCH_SIZE);
-      cursor += batch.length;
-      const resolved = await Promise.all(batch.map(it => resolveBestRowForDelivery(it)));
-      const results = await Promise.all(resolved.map(it => deliverOne(it)));
-      for (const r of results) {
-        if (r.skippable) { quitOuter = true; }
+  const passes = [];
+  const hotKeyPath = `bot_file_ids.${BOT_KEY}`;
+  passes.push({
+    name: 'hot-only',
+    description: 'FAST PATH - only rows already uploaded by THIS bot (HOT slot, instant Bot API send, 0 userbot)',
+    filterExtra: { [hotKeyPath]: { $exists: true, $ne: null } },
+  });
+  if (fileManagerChannelId != null) {
+    passes.push({
+      name: 'own-channel-only',
+      description: 'MEDIUM PATH - rows from our fileManagerChannel (guaranteed copyMessage accessible; userbot if no hot slot)',
+      filterExtra: { 'source.channel_id': String(fileManagerChannelId) },
+    });
+    passes.push({
+      name: 'accessible-first',
+      description: 'FAST+MEDIUM combined (hot slot OR own channel source)',
+      filterExtra: {
+        $or: [
+          { 'source.channel_id': String(fileManagerChannelId) },
+          { [hotKeyPath]: { $exists: true, $ne: null } },
+        ],
+      },
+    });
+  }
+  passes.push({ name: 'fallback-full-pool', description: 'SLOW PATH - full pool with sibling lookup + userbot tier', filterExtra: {} });
+
+  for (const pass of passes) {
+    if (delivered.length >= TARGET || shouldAbortChat) break;
+    while (delivered.length < TARGET && !shouldAbortChat) {
+      const filterBase = { _id: { $nin: Array.from(usedIds) } };
+      const filter = pass.filterExtra && Object.keys(pass.filterExtra).length ? { $and: [filterBase, pass.filterExtra] } : filterBase;
+      const available = await Media.countDocuments(filter);
+      if (available === 0) break;
+      if (hardFailStreak >= HARD_FAIL_ABORT_STREAK) {
+        console.error(`[delivery] bail after ${hardFailStreak} consecutive hard-fails streak; total fails=${hardFailTotal}; returning ${delivered.length}/${TARGET} chat=${chatId} pass=${pass.name}`);
+        break;
       }
-      if (hardFailStreak >= HARD_FAIL_ABORT_STREAK || hardFailTotal >= HARD_FAIL_ABORT_TOTAL) {
-        quitOuter = true;
+      if (hardFailTotal >= HARD_FAIL_ABORT_TOTAL) {
+        console.error(`[delivery] bail after ${hardFailTotal} cumulative hard-fails; returning ${delivered.length}/${TARGET} chat=${chatId} pass=${pass.name}`);
+        break;
+      }
+      const remaining = TARGET - delivered.length;
+      const sampleSize = Math.min(Math.max(remaining * SAMPLING_MAX_MULT, remaining + SAMPLING_MIN), available);
+      const candidates = await Media.aggregate([{ $match: filter }, { $sample: { size: sampleSize } }]);
+      if (!candidates.length) break;
+      // #region debug-point H2:sample-candidates
+      (()=>{const fs=require('fs'),p='.dbg/gift-progress-stuck.env';let u='http://127.0.0.1:7777/event',s='gift-progress-stuck';try{const e=fs.readFileSync(p,'utf8');u=e.match(/DEBUG_SERVER_URL=(.+)/)?.[1]||u;s=e.match(/DEBUG_SESSION_ID=(.+)/)?.[1]||s}catch{}const fmcS=String(fileManagerChannelId||'');const ownCh=candidates.filter(c=>String(c.source?.channel_id||'')===fmcS).length;const hotS=candidates.filter(c=>!!(c.bot_file_ids&&c.bot_file_ids[BOT_KEY])).length;const foreign=candidates.length-ownCh;const siblingCandidates=candidates.filter(c=>String(c.source?.channel_id||'')!==fmcS).map(c=>String(c.capture_key||''));fetch(u,{method:'POST',body:JSON.stringify({sessionId:s,runId:'post2',hypothesisId:'H2',location:'mediaService.js:deliverMedia-sample',msg:'[DEBUG] deliverMedia sample round',data:{pass:pass.name,TARGET,deliveredNow:delivered.length,sampleSize,candidates:candidates.length,ownChannelRows:ownCh,hotSlotRows:hotS,foreignRows:foreign,uniqueForeignCKs:new Set(siblingCandidates.filter(Boolean)).size,usedIdsSize:usedIds.size,available,hardFailStreak,hardFailTotal},ts:Date.now()})}).catch(()=>{})})();
+      // #endregion
+      let cursor = 0;
+      let quitOuter = false;
+      while (cursor < candidates.length && delivered.length < TARGET && !quitOuter && !shouldAbortChat) {
+        const batch = candidates.slice(cursor, cursor + PARALLEL_BATCH_SIZE);
+        cursor += batch.length;
+        const batchIds = batch.map(x => String(x._id));
+        // #region debug-point H4:batch-start
+        (()=>{const fs=require('fs'),p='.dbg/gift-progress-stuck.env';let u='http://127.0.0.1:7777/event',s='gift-progress-stuck';try{const e=fs.readFileSync(p,'utf8');u=e.match(/DEBUG_SERVER_URL=(.+)/)?.[1]||u;s=e.match(/DEBUG_SESSION_ID=(.+)/)?.[1]||s}catch{}fetch(u,{method:'POST',body:JSON.stringify({sessionId:s,runId:'post2',hypothesisId:'H4',location:'mediaService.js:deliverMedia-batch-start',msg:'[DEBUG] batch processing start',data:{pass:pass.name,batchSize:batch.length,batchIds:batchIds.map(i=>i.slice(0,8)),deliveredNow:delivered.length,cursor,candidatesLen:candidates.length,TARGET,PARALLEL_BATCH_SIZE},ts:Date.now()})}).catch(()=>{})})();
+        // #endregion
+        const resolved = await Promise.all(batch.map(it => resolveBestRowForDelivery(it)));
+        const fmcS = String(fileManagerChannelId || '');
+        const prune = [];
+        const toDeliver = [];
+        for (let i = 0; i < resolved.length; i++) {
+          const r = resolved[i];
+          const isOwn = String(r.source?.channel_id || '') === fmcS;
+          const hasHot = !!(r.bot_file_ids && r.bot_file_ids[BOT_KEY]);
+          if (pass.name === 'hot-only' && !hasHot) { prune.push(r); continue; }
+          if (pass.name === 'own-channel-only' && !isOwn && !hasHot) { prune.push(r); continue; }
+          if (!isOwn && !hasHot && (pass.name !== 'fallback-full-pool')) { prune.push(r); continue; }
+          toDeliver.push(r);
+        }
+        if (prune.length) {
+          for (const p of prune) if (p && p._id != null) usedIds.add(String(p._id));
+        }
+        // #region debug-point H4:batch-resolved
+        (()=>{const fs=require('fs'),p='.dbg/gift-progress-stuck.env';let u='http://127.0.0.1:7777/event',s='gift-progress-stuck';try{const e=fs.readFileSync(p,'utf8');u=e.match(/DEBUG_SERVER_URL=(.+)/)?.[1]||u;s=e.match(/DEBUG_SESSION_ID=(.+)/)?.[1]||s}catch{}const afterOwnCh=toDeliver.filter(r=>String(r.source?.channel_id||'')===fmcS).length;const afterHot=toDeliver.filter(r=>!!(r.bot_file_ids&&r.bot_file_ids[BOT_KEY])).length;const sibCount=resolved.filter(r=>!!r._deliverySiblingOf).length;fetch(u,{method:'POST',body:JSON.stringify({sessionId:s,runId:'post2',hypothesisId:'H4',location:'mediaService.js:deliverMedia-batch-resolved',msg:'[DEBUG] batch resolveBestRowForDelivery done + prune',data:{pass:pass.name,batchSize:resolved.length,toDeliverSize:toDeliver.length,prunedSize:prune.length,siblingMapped:sibCount,afterOwnChannelRows:afterOwnCh,afterHotSlotRows:afterHot},ts:Date.now()})}).catch(()=>{})})();
+        // #endregion
+        let results = [];
+        if (toDeliver.length) results = await Promise.all(toDeliver.map(it => deliverOne(it)));
+        // #region debug-point H4:batch-done
+        (()=>{const fs=require('fs'),p='.dbg/gift-progress-stuck.env';let u='http://127.0.0.1:7777/event',s='gift-progress-stuck';try{const e=fs.readFileSync(p,'utf8');u=e.match(/DEBUG_SERVER_URL=(.+)/)?.[1]||u;s=e.match(/DEBUG_SESSION_ID=(.+)/)?.[1]||s}catch{}const oks=results.filter(r=>r.ok).length;const skips=results.filter(r=>r.skippable).length;const fails=results.length-oks-skips;fetch(u,{method:'POST',body:JSON.stringify({sessionId:s,runId:'post2',hypothesisId:'H4',location:'mediaService.js:deliverMedia-batch-done',msg:'[DEBUG] batch deliverOne done',data:{pass:pass.name,batchSize:toDeliver.length,okRows:oks,skippable:skips,fails,deliveredAfter:delivered.length,prunedFromBatch:prune.length},ts:Date.now()})}).catch(()=>{})})();
+        // #endregion
+        for (const r of results) {
+          if (r.skippable) { quitOuter = true; }
+        }
+        if (hardFailStreak >= HARD_FAIL_ABORT_STREAK || hardFailTotal >= HARD_FAIL_ABORT_TOTAL) {
+          quitOuter = true;
+        }
       }
     }
   }

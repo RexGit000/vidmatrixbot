@@ -171,6 +171,9 @@ async function deliverWithVerification({
     traceLines.push(`[dWV round=${attempts}] needed=${needed} excludeIds.length=${baseExclude.length} rememberList=${rememberList.length}`);
     let items = [];
     try {
+      // #region debug-point H5:dWV-round-start
+      (()=>{const fs=require('fs'),p='.dbg/gift-progress-stuck.env';let u='http://127.0.0.1:7777/event',s='gift-progress-stuck';try{const e=fs.readFileSync(p,'utf8');u=e.match(/DEBUG_SERVER_URL=(.+)/)?.[1]||u;s=e.match(/DEBUG_SESSION_ID=(.+)/)?.[1]||s}catch{}fetch(u,{method:'POST',body:JSON.stringify({sessionId:s,runId:'pre',hypothesisId:'H5',location:'mediaSendObserver.js:dwv-round-start',msg:'[DEBUG] dWV round starting deliverMediaFn',data:{attempts,needed,baseExcludeLen:baseExclude.length,promised,actualCount},ts:Date.now()})}).catch(()=>{})})();
+      // #endregion
       items = await Promise.race([
         (async () => {
           const v = await deliverMediaFn(telegram, chatOrUser, needed, {
@@ -185,6 +188,9 @@ async function deliverWithVerification({
     } catch (deliveryErr) {
       console.error('[deliverWithVerification] deliverMediaFn threw/stalled:', deliveryErr.message);
       traceLines.push(`[dWV round=${attempts}] deliverMediaFn throw=${String(deliveryErr.message).slice(0, 120)}`);
+      // #region debug-point H5:dWV-round-throw
+      (()=>{const fs=require('fs'),p='.dbg/gift-progress-stuck.env';let u='http://127.0.0.1:7777/event',s='gift-progress-stuck';try{const e=fs.readFileSync(p,'utf8');u=e.match(/DEBUG_SERVER_URL=(.+)/)?.[1]||u;s=e.match(/DEBUG_SESSION_ID=(.+)/)?.[1]||s}catch{}fetch(u,{method:'POST',body:JSON.stringify({sessionId:s,runId:'pre',hypothesisId:'H5',location:'mediaSendObserver.js:dwv-round-throw',msg:'[DEBUG] dWV round deliverMediaFn throw',data:{attempts,err:String(deliveryErr.message||deliveryErr).slice(0,200),stack:(deliveryErr.stack||'').slice(0,220)},ts:Date.now()})}).catch(()=>{})})();
+      // #endregion
       lastReturnedCount = 0;
       break;
     }
@@ -193,6 +199,9 @@ async function deliverWithVerification({
     actualCount += returnedThisRound;
     const anyChanged = rememberInline(items);
     traceLines.push(`[dWV round=${attempts}] returned=${returnedThisRound} anyChanged=${anyChanged ? 1 : 0} actualAfter=${actualCount} rememberList=${rememberList.length}`);
+    // #region debug-point H5:dWV-round-result
+    (()=>{const fs=require('fs'),p='.dbg/gift-progress-stuck.env';let u='http://127.0.0.1:7777/event',s='gift-progress-stuck';try{const e=fs.readFileSync(p,'utf8');u=e.match(/DEBUG_SERVER_URL=(.+)/)?.[1]||u;s=e.match(/DEBUG_SESSION_ID=(.+)/)?.[1]||s}catch{}fetch(u,{method:'POST',body:JSON.stringify({sessionId:s,runId:'pre',hypothesisId:'H5',location:'mediaSendObserver.js:dwv-round-result',msg:'[DEBUG] dWV round deliverMediaFn returned',data:{attempts,returnedThisRound,actualCount,anyChanged,rememberListLen:rememberList.length,promised},ts:Date.now()})}).catch(()=>{})})();
+    // #endregion
     if (typeof onNewBatchDelivered === 'function') {
       try { await Promise.resolve(onNewBatchDelivered(items)); } catch (_e) { /* swallow */ }
     }

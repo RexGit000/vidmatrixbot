@@ -201,7 +201,20 @@ giftMediaScene.on(message('text'), async (ctx) => {
         (sec >= 10 ? ` (${sec}s so far)` : '') +
         `\nTo: ${nameCompact(user)}`;
       try {
-        await ctx.telegram.editMessageText(ctx.chat.id, holdMessageId, null, text).catch(() => {});
+        // #region debug-point H3:progress-edit
+        (()=>{const fs=require('fs'),p='.dbg/gift-progress-stuck.env';let u='http://127.0.0.1:7777/event',s='gift-progress-stuck';try{const e=fs.readFileSync(p,'utf8');u=e.match(/DEBUG_SERVER_URL=(.+)/)?.[1]||u;s=e.match(/DEBUG_SESSION_ID=(.+)/)?.[1]||s}catch{}fetch(u,{method:'POST',body:JSON.stringify({sessionId:s,runId:'pre',hypothesisId:'H3',location:'giftMedia.js:updateHoldProgress',msg:'[DEBUG] progress edit call',data:{holdMessageId,delivered,target,text:text.length,sec},ts:Date.now()})}).catch(()=>{})})();
+        // #endregion
+        await ctx.telegram.editMessageText(ctx.chat.id, holdMessageId, null, text)
+          .then(() => {
+            // #region debug-point H3:progress-edit-ok
+            (()=>{const fs=require('fs'),p='.dbg/gift-progress-stuck.env';let u='http://127.0.0.1:7777/event',s='gift-progress-stuck';try{const e=fs.readFileSync(p,'utf8');u=e.match(/DEBUG_SERVER_URL=(.+)/)?.[1]||u;s=e.match(/DEBUG_SESSION_ID=(.+)/)?.[1]||s}catch{}fetch(u,{method:'POST',body:JSON.stringify({sessionId:s,runId:'pre',hypothesisId:'H3',location:'giftMedia.js:updateHoldProgress-ok',msg:'[DEBUG] progress edit success',data:{delivered,target,sec},ts:Date.now()})}).catch(()=>{})})();
+            // #endregion
+          })
+          .catch((editErr) => {
+            // #region debug-point H3:progress-edit-err
+            (()=>{const fs=require('fs'),p='.dbg/gift-progress-stuck.env';let u='http://127.0.0.1:7777/event',s='gift-progress-stuck';try{const e=fs.readFileSync(p,'utf8');u=e.match(/DEBUG_SERVER_URL=(.+)/)?.[1]||u;s=e.match(/DEBUG_SESSION_ID=(.+)/)?.[1]||s}catch{}fetch(u,{method:'POST',body:JSON.stringify({sessionId:s,runId:'pre',hypothesisId:'H3',location:'giftMedia.js:updateHoldProgress-err',msg:'[DEBUG] progress edit err',data:{delivered,target,err:String(editErr?.message||editErr).slice(0,160)},ts:Date.now()})}).catch(()=>{})})();
+            // #endregion
+          });
       } catch (_e) {}
     }
 
@@ -209,6 +222,9 @@ giftMediaScene.on(message('text'), async (ctx) => {
       let result = null;
       let fatalErr = null;
       try {
+        // #region debug-point H1:iife-start
+        (()=>{const fs=require('fs'),p='.dbg/gift-progress-stuck.env';let u='http://127.0.0.1:7777/event',s='gift-progress-stuck';try{const e=fs.readFileSync(p,'utf8');u=e.match(/DEBUG_SERVER_URL=(.+)/)?.[1]||u;s=e.match(/DEBUG_SESSION_ID=(.+)/)?.[1]||s}catch{}fetch(u,{method:'POST',body:JSON.stringify({sessionId:s,runId:'pre',hypothesisId:'H1',location:'giftMedia.js:iife-start',msg:'[DEBUG] gift IIFE starting deliverWithVerification',data:{count:count,userTelegramId:user.telegramId,userId:user.id,holdMessageId,adminChatId:ctx.chat?.id},ts:Date.now()})}).catch(()=>{})})();
+        // #endregion
         result = await deliverWithVerification({
           telegram: ctx.telegram,
           chatId: user.telegramId,
@@ -245,11 +261,17 @@ giftMediaScene.on(message('text'), async (ctx) => {
 
       let reply;
       if (fatalErr) {
+        // #region debug-point H1:iife-fatal
+        (()=>{const fs=require('fs'),p='.dbg/gift-progress-stuck.env';let u='http://127.0.0.1:7777/event',s='gift-progress-stuck';try{const e=fs.readFileSync(p,'utf8');u=e.match(/DEBUG_SERVER_URL=(.+)/)?.[1]||u;s=e.match(/DEBUG_SESSION_ID=(.+)/)?.[1]||s}catch{}fetch(u,{method:'POST',body:JSON.stringify({sessionId:s,runId:'pre',hypothesisId:'H1',location:'giftMedia.js:iife-fatal',msg:'[DEBUG] gift fatal err',data:{err:String(fatalErr?.message||fatalErr).slice(0,220),stack:(fatalErr?.stack||'').slice(0,240)},ts:Date.now()})}).catch(()=>{})})();
+        // #endregion
         reply = `❌ Gift failed to send. ${fatalErr.message ? 'Error: ' + String(fatalErr.message).slice(0, 220) : ''}`;
       } else {
         const promised = result.promised;
         const actual = result.actualCount;
         const shortfall = result.shortfall;
+        // #region debug-point H1:iife-done
+        (()=>{const fs=require('fs'),p='.dbg/gift-progress-stuck.env';let u='http://127.0.0.1:7777/event',s='gift-progress-stuck';try{const e=fs.readFileSync(p,'utf8');u=e.match(/DEBUG_SERVER_URL=(.+)/)?.[1]||u;s=e.match(/DEBUG_SESSION_ID=(.+)/)?.[1]||s}catch{}fetch(u,{method:'POST',body:JSON.stringify({sessionId:s,runId:'pre',hypothesisId:'H1',location:'giftMedia.js:iife-done',msg:'[DEBUG] gift IIFE done dWV result',data:{promised,actual,shortfall,attempts:result.attempts,lastReturnedCount:result.lastReturnedCount},ts:Date.now()})}).catch(()=>{})})();
+        // #endregion
         if (shortfall > 0) {
           reply =
             `⚠️ Not enough media in the pool to fill this gift.\n` +
