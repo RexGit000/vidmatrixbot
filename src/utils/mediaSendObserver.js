@@ -168,16 +168,21 @@ async function deliverWithVerification({
   let lastReturnedCount = 0;
   let actualCount = 0;
   let attempts = 0;
+  const traceLines = [];
+  const chatOrUser = Number(chatId) ?? Number(userId);
+  traceLines.push(`[dWV enter] promised=${promised} chat/user=${chatOrUser} receivedMedia=${Array.isArray(userRecord?.receivedMedia) ? userRecord.receivedMedia.length : '0/null'}`);
 
   while (attempts < MAX_TOTAL_DELIVERY_ATTEMPTS && actualCount < promised) {
     attempts += 1;
     const needed = Math.max(0, promised - actualCount);
+    const baseExclude = Array.isArray(userRecord?.receivedMedia) ? userRecord.receivedMedia.slice().concat(rememberList) : rememberList.slice();
+    traceLines.push(`[dWV round=${attempts}] needed=${needed} excludeIds.length=${baseExclude.length} rememberList=${rememberList.length}`);
     let items = [];
     try {
       items = await Promise.race([
         (async () => {
-          const v = await deliverMediaFn(telegram, Number(chatId) ?? Number(userId), needed, {
-            excludeIds: Array.isArray(userRecord?.receivedMedia) ? userRecord.receivedMedia.slice().concat(rememberList) : rememberList.slice(),
+          const v = await deliverMediaFn(telegram, chatOrUser, needed, {
+            excludeIds: baseExclude,
           });
           return Array.isArray(v) ? v : [];
         })(),
@@ -187,6 +192,7 @@ async function deliverWithVerification({
       ]);
     } catch (deliveryErr) {
       console.error('[deliverWithVerification] deliverMediaFn threw/stalled:', deliveryErr.message);
+      traceLines.push(`[dWV round=${attempts}] deliverMediaFn throw=${String(deliveryErr.message).slice(0, 120)}`);
       lastReturnedCount = 0;
       break;
     }
@@ -194,19 +200,22 @@ async function deliverWithVerification({
     lastReturnedCount = returnedThisRound;
     actualCount += returnedThisRound;
     const anyChanged = rememberInline(items);
+    traceLines.push(`[dWV round=${attempts}] returned=${returnedThisRound} anyChanged=${anyChanged ? 1 : 0} actualAfter=${actualCount} rememberList=${rememberList.length}`);
     if (typeof onNewBatchDelivered === 'function') {
       try { await Promise.resolve(onNewBatchDelivered(items)); } catch (_e) { /* swallow */ }
     }
     if (!anyChanged && typeof rememberDeliveredMediaFn === 'function' && userRecord) {
       try { rememberDeliveredMediaFn(userRecord, items); } catch (_e) { /* swallow */ }
     }
-    if (actualCount >= promised) break;
-    if (returnedThisRound === 0) break;
+    if (actualCount >= promised) { traceLines.push(`[dWV exit] actual >= promised (round=${attempts})`); break; }
+    if (returnedThisRound === 0) { traceLines.push(`[dWV exit] zero returned round=${attempts}`); break; }
   }
 
   if (actualCount > promised) actualCount = promised;
 
   const shortfall = Math.max(0, promised - actualCount);
+  traceLines.push(`[dWV final] promised=${promised} actual=${actualCount} shortfall=${shortfall} attempts=${attempts}`);
+  console.log(traceLines.join('\n'));
   if (shortfall > 0) {
     try {
       await alertChronicShortfall(telegram, adminIdResolver, {

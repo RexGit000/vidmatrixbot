@@ -4,12 +4,104 @@ const UserbotAccount = require('../models/UserbotAccount');
 const Settings = require('../models/Settings');
 const { deliveryCache } = require('../cache');
 const { enqueueDeliver } = require('./queue');
+const { TelegramClient } = require('telegram');
+const { StringSession } = require('telegram/sessions');
+const { Api } = require('telegram/tl');
 
 const BOT_KEY = String(process.env.CURRENT_BOT_KEY || (process.env.BOT_TOKEN || '').split(':')[0] || 'default').trim();
 
 const pendingPromiseCache = new LRUCache({ max: 1000, ttl: 60 * 1000 });
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+let _userbotClientSingleton = null;
+let _userbotClientAccountId = null;
+let _userbotClientInitLock = null;
+async function getUserbotClient() {
+  if (_userbotClientSingleton && _userbotClientAccountId) {
+    if (_userbotClientSingleton.connected) return _userbotClientSingleton;
+  }
+  if (_userbotClientInitLock) return _userbotClientInitLock;
+  _userbotClientInitLock = (async () => {
+    const row = await UserbotAccount.findOne({ session: { $ne: null, $exists: true } })
+      .select('_id session api_id api_hash')
+      .sort({ updatedAt: -1 })
+      .limit(1)
+      .lean();
+    if (!row || !row.session) return null;
+    const apiId = Number(row.api_id || process.env.API_ID || 0) || null;
+    const apiHash = String(row.api_hash || process.env.API_HASH || '').trim() || null;
+    if (!apiId || !apiHash) {
+      console.warn('[userbot] saved session exists but API_ID/API_HASH not set — userbot direct fallback unavailable.');
+      return null;
+    }
+    let client = new TelegramClient(new StringSession(row.session), apiId, apiHash, {
+      useWSS: true,
+      autoReconnect: true,
+      timeout: 20000,
+      requestRetries: 1,
+      connectionRetries: 2,
+      retryDelay: 1000,
+    });
+    client.setLogLevel?.('error');
+    try { if (typeof client.on === 'function') client.on('error', () => {}); } catch (_) {}
+    try { await client.connect({ timeout: 30000 }); } catch (e) {
+      console.warn('[userbot] connect failed:', e.message);
+      try { await client.destroy?.()?.catch?.(() => {}); } catch (_) {}
+      return null;
+    }
+    try {
+      const me = await client.getMe({ timeout: 15000 }).catch(() => null);
+      if (!me) {
+        console.warn('[userbot] client connected but getMe failed — session likely stale.');
+        try { await client.destroy?.()?.catch?.(() => {}); } catch (_) {}
+        return null;
+      }
+    } catch (e) {
+      console.warn('[userbot] getMe failed:', e.message);
+      try { await client.destroy?.()?.catch?.(() => {}); } catch (_) {}
+      return null;
+    }
+    _userbotClientSingleton = client;
+    _userbotClientAccountId = String(row._id);
+    return client;
+  })();
+  try {
+    const c = await _userbotClientInitLock;
+    return c;
+  } finally {
+    _userbotClientInitLock = null;
+  }
+}
+
+async function uploadFileViaUserbot(userbotClient, row, chatId) {
+  if (!row || !row.source || !row.source.channel_id || !row.source.message_id) return null;
+  try {
+    const fromPeer = await userbotClient.getInputEntity(Number(row.source.channel_id));
+    const msgIds = [Number(row.source.message_id)];
+    const msgs = await userbotClient.invoke(new Api.channels.GetMessages({ channel: fromPeer, id: msgIds }), { timeout: 20000 });
+    const list = msgs && Array.isArray(msgs.messages) ? msgs.messages : [];
+    if (!list.length) return null;
+    const m = list[0];
+    const media = m && (m.media || (m.message && null));
+    if (!media) return null;
+    const toPeer = await userbotClient.getInputEntity(Number(chatId));
+    const fileFromMedia = await userbotClient.uploadFile({ file: media, workers: 1 }).catch(() => null);
+    if (fileFromMedia) return { ok: true, via: 'userbot_upload' };
+    const forwarded = await userbotClient.invoke(new Api.messages.SendMedia({
+      peer: toPeer,
+      media: media,
+      message: '',
+      randomId: Math.floor(Math.random() * 1e18),
+    }), { timeout: 40000 });
+    if (forwarded && forwarded.id) {
+      return { ok: true, via: 'userbot_sendMedia', messageId: Number(forwarded.id) };
+    }
+    return null;
+  } catch (e) {
+    return null;
+  }
+}
 
 function isTimeoutError(err) {
   if (!err) return false;
@@ -93,11 +185,8 @@ function summarizeErr(err) {
 
 async function hasActiveUserbot() {
   try {
-    const row = await UserbotAccount.findOne({ session: { $ne: null, $exists: true } })
-      .select('_id')
-      .limit(1)
-      .lean();
-    return !!row;
+    const c = await getUserbotClient();
+    return !!c;
   } catch (err) {
     console.error('[delivery] hasActiveUserbot error:', err.message);
     return false;
@@ -295,135 +384,169 @@ async function coldForwardAndSeed(telegram, chatId, row, replyToMessageId, fileM
   }
 }
 
-async function userbotDirectFallback(row, chatId) {
+async function userbotDirectFallback(row, chatId, userbotClient) {
+  const client = userbotClient || (await getUserbotClient().catch(() => null));
+  if (!client) {
+    return { ok: false, reason: 'no_userbot_client' };
+  }
   try {
-    const ok = await hasActiveUserbot();
-    if (!ok) {
-      console.warn('[delivery] userbot fallback skipped: no userbot session in DB (plan 4/5 silent).');
-      return { ok: false, reason: 'no_userbot_session' };
+    const startedAt = Date.now();
+    const res = await uploadFileViaUserbot(client, row, chatId);
+    if (res && res.ok) {
+      return { ok: true, via: res.via || 'userbot', messageId: res.messageId, elapsedMs: Date.now() - startedAt };
     }
-    return { ok: false, reason: 'userbot_engine_stub' };
+    return { ok: false, reason: 'userbot_send_failed', hardFail: false };
   } catch (err) {
     console.error('[delivery] userbotDirectFallback error:', err.message);
-    return { ok: false, reason: 'userbot_error', error: err };
+    return { ok: false, reason: 'userbot_error', error: err, hardFail: false };
   }
 }
 
-async function deliverMedia(telegram, chatId, count, { excludeIds = [] } = {}) {
+async function deliverMedia(telegram, chatId, count, { excludeIds = [], onProgress } = {}) {
+  const countNum = Number(count) || 0;
+  const TARGET = Math.max(1, Math.floor(countNum));
   const delivered = [];
-  const usedIds = new Set(excludeIds.map((id) => id.toString()));
+  const usedIds = new Set(excludeIds.map((id) => String(id)));
   let shouldAbortChat = false;
   let hardFailStreak = 0;
   let hardFailTotal = 0;
   const HARD_FAIL_ABORT_STREAK = 8;
   const HARD_FAIL_ABORT_TOTAL = 40;
+  const PARALLEL_BATCH_SIZE = Number(process.env.DELIVERY_PARALLEL) || 12;
+  const SAMPLING_MAX_MULT = 30;
+  const SAMPLING_MIN = 120;
+  const onProgressFn = typeof onProgress === 'function' ? onProgress : null;
+  const startedAt = Date.now();
+  let tierCounts = { hot: 0, userbot: 0, cold: 0 };
+  let tierElapsed = { hot: 0, userbot: 0, cold: 0 };
 
   let fileManagerChannelId = null;
-  try {
-    fileManagerChannelId = await Settings.get('fileManagerChannel');
-  } catch (_e) { /* ignore */ }
+  try { fileManagerChannelId = await Settings.get('fileManagerChannel'); } catch (_e) {}
 
-  const BOT_KEY_LOCAL = BOT_KEY;
+  const userbotClient = await getUserbotClient().catch(() => null);
+  const userbotAvailable = !!userbotClient;
 
-  while (delivered.length < count && !shouldAbortChat) {
+  function emitProgress(eventName, payload) {
+    if (!onProgressFn) return;
+    try { onProgressFn(eventName, { ...(payload || {}), target: TARGET, delivered: delivered.length, elapsedMs: Date.now() - startedAt, tierCounts, tierElapsed }); } catch (_e) {}
+  }
+
+  emitProgress('begin');
+
+  async function deliverOne(item, stopToken) {
+    const itemId = item._id.toString();
+    if (usedIds.has(itemId)) return { consumed: false, ok: false };
+    usedIds.add(itemId);
+
+    const t0 = Date.now();
+    let sentOk = false;
+    let skippableHit = false;
+    let hardFailHit = false;
+    let via = null;
+
+    const resHot = await hotSendMedia(telegram, chatId, item);
+    if (resHot && resHot.ok) {
+      sentOk = true; via = 'hot';
+      tierCounts.hot += 1; tierElapsed.hot += Date.now() - t0;
+    } else if (resHot && resHot.skippable) {
+      skippableHit = true;
+    } else if (resHot && resHot.hardFail === false) {
+      hardFailHit = true;
+    }
+
+    if (!sentOk && !skippableHit && userbotAvailable) {
+      const tub = Date.now();
+      const resUb = await userbotDirectFallback(item, chatId, userbotClient);
+      if (resUb && resUb.ok) {
+        sentOk = true; via = 'userbot'; hardFailHit = false;
+        tierCounts.userbot += 1; tierElapsed.userbot += Date.now() - tub;
+      } else if (resUb && resUb.skippable) {
+        skippableHit = true; hardFailHit = false;
+      } else if (resUb && resUb.hardFail === false) {
+        hardFailHit = true;
+      }
+    }
+
+    if (!sentOk && !skippableHit) {
+      const sourceOk = item && item.source &&
+        item.source.channel_id && item.source.message_id != null && item.source.channel_id !== '';
+      if (sourceOk) {
+        const tc = Date.now();
+        const resCold = await coldForwardAndSeed(telegram, chatId, item, null, fileManagerChannelId);
+        if (resCold && resCold.ok) {
+          sentOk = true; via = 'cold'; hardFailHit = false;
+          tierCounts.cold += 1; tierElapsed.cold += Date.now() - tc;
+        } else if (resCold && resCold.skippable) {
+          skippableHit = true; hardFailHit = false;
+        } else if (resCold && resCold.hardFail === false) {
+          hardFailHit = true;
+        }
+      }
+    }
+
+    if (skippableHit) {
+      shouldAbortChat = true;
+      return { consumed: true, ok: false, skippable: true };
+    }
+    if (sentOk) {
+      hardFailStreak = 0;
+      delivered.push(item);
+      try {
+        Media.updateOne({ _id: item._id }, { $set: { last_seen_at: new Date() } }).catch(() => {});
+      } catch (_) {}
+      emitProgress('batch', { itemId, via });
+      return { consumed: true, ok: true, via };
+    } else {
+      if (hardFailHit) {
+        hardFailStreak += 1;
+        hardFailTotal += 1;
+      }
+      return { consumed: true, ok: false, hardFailHit };
+    }
+  }
+
+  while (delivered.length < TARGET && !shouldAbortChat) {
     const filter = { _id: { $nin: Array.from(usedIds) } };
     const available = await Media.countDocuments(filter);
-
     if (available === 0) break;
-
     if (hardFailStreak >= HARD_FAIL_ABORT_STREAK) {
-      console.error(`[delivery] bailing after ${hardFailStreak} consecutive hard-fails (total fails=${hardFailTotal}); returning ${delivered.length}/${count} for chat=${chatId}`);
+      console.error(`[delivery] bail after ${hardFailStreak} consecutive hard-fails streak; total fails=${hardFailTotal}; returning ${delivered.length}/${TARGET} chat=${chatId}`);
       break;
     }
     if (hardFailTotal >= HARD_FAIL_ABORT_TOTAL) {
-      console.error(`[delivery] bailing after ${hardFailTotal} cumulative hard-fails; returning ${delivered.length}/${count} for chat=${chatId}`);
+      console.error(`[delivery] bail after ${hardFailTotal} cumulative hard-fails; returning ${delivered.length}/${TARGET} chat=${chatId}`);
       break;
     }
-
-    const needed = count - delivered.length;
-    const sampleSize = Math.min(Math.max(needed * 40, needed + 80), available);
-    const pipeline = [
-      { $match: filter },
-      { $sample: { size: sampleSize } },
-    ];
-    const candidates = await Media.aggregate(pipeline);
-
+    const remaining = TARGET - delivered.length;
+    const sampleSize = Math.min(Math.max(remaining * SAMPLING_MAX_MULT, remaining + SAMPLING_MIN), available);
+    const candidates = await Media.aggregate([{ $match: filter }, { $sample: { size: sampleSize } }]);
     if (!candidates.length) break;
-
-    for (const item of candidates) {
-      const itemId = item._id.toString();
-      if (usedIds.has(itemId)) continue;
-
-      let sentOk = false;
-      let skippableHit = false;
-      let hardFailHit = false;
-
-      let res = await hotSendMedia(telegram, chatId, item);
-      if (res && res.ok) {
-        sentOk = true;
-      } else if (res && res.skippable) {
-        skippableHit = true;
-      } else if (res && res.hardFail === false) {
-        hardFailHit = true;
+    let cursor = 0;
+    let quitOuter = false;
+    while (cursor < candidates.length && delivered.length < TARGET && !quitOuter && !shouldAbortChat) {
+      const batch = candidates.slice(cursor, cursor + PARALLEL_BATCH_SIZE);
+      cursor += batch.length;
+      const results = await Promise.all(batch.map(it => deliverOne(it)));
+      for (const r of results) {
+        if (r.skippable) { quitOuter = true; }
       }
-
-      if (!sentOk && !skippableHit) {
-        const sourceOk = item && item.source &&
-          item.source.channel_id &&
-          item.source.message_id != null &&
-          item.source.channel_id !== '';
-        if (sourceOk) {
-          res = await coldForwardAndSeed(telegram, chatId, item, null, fileManagerChannelId);
-          if (res && res.ok) {
-            sentOk = true;
-            hardFailHit = false;
-          } else if (res && res.skippable) {
-            skippableHit = true;
-            hardFailHit = false;
-          } else if (res && res.hardFail === false) {
-            hardFailHit = true;
-          }
-        }
-      }
-
-      if (!sentOk && !skippableHit) {
-        res = await userbotDirectFallback(item, chatId);
-        if (res && res.ok) {
-          sentOk = true;
-          hardFailHit = false;
-        }
-      }
-
-      if (skippableHit) {
-        usedIds.add(itemId);
-        shouldAbortChat = true;
-        break;
-      }
-
-      if (sentOk) {
-        delivered.push(item);
-        usedIds.add(itemId);
-        hardFailStreak = 0;
-        try {
-          await Media.updateOne(
-            { _id: item._id },
-            { $set: { last_seen_at: new Date() } }
-          ).catch(() => {});
-        } catch (_) {}
-        if (delivered.length === count) break;
-      } else {
-        usedIds.add(itemId);
-        if (hardFailHit) {
-          hardFailStreak += 1;
-          hardFailTotal += 1;
-          if (hardFailStreak >= HARD_FAIL_ABORT_STREAK || hardFailTotal >= HARD_FAIL_ABORT_TOTAL) break;
-        }
-        continue;
+      if (hardFailStreak >= HARD_FAIL_ABORT_STREAK || hardFailTotal >= HARD_FAIL_ABORT_TOTAL) {
+        quitOuter = true;
       }
     }
   }
 
-  return delivered;
+  const finalSlice = delivered.slice(0, TARGET);
+  const totalElapsed = Date.now() - startedAt;
+  emitProgress('end', { finalCount: finalSlice.length });
+  console.log(
+    `[delivery] summary chat=${chatId} target=${TARGET} delivered=${finalSlice.length} ` +
+    `elapsed=${totalElapsed}ms ` +
+    `tier(hot=${tierCounts.hot},ub=${tierCounts.userbot},cold=${tierCounts.cold}) ` +
+    `elapsed(hot=${tierElapsed.hot}ms,ub=${tierElapsed.userbot}ms,cold=${tierElapsed.cold}ms) ` +
+    `streak=${hardFailStreak} fails=${hardFailTotal} abortChat=${shouldAbortChat ? 1 : 0}`
+  );
+  return finalSlice;
 }
 
 module.exports = { deliverMedia, withRetry, BOT_KEY, hotSendMedia, coldForwardAndSeed, userbotDirectFallback, hasActiveUserbot };
