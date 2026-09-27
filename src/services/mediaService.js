@@ -11,20 +11,44 @@ const pendingPromiseCache = new LRUCache({ max: 1000, ttl: 60 * 1000 });
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-async function withRetry(fn, maxRetries = 5) {
+function isTimeoutError(err) {
+  if (!err) return false;
+  const name = err?.name || '';
+  const msg  = String(err?.message || err?.description || '').toLowerCase();
+  if (name === 'TimeoutError') return true;
+  if (msg.includes('promise timed out after')) return true;
+  if (msg.includes('timeout')) return true;
+  return false;
+}
+
+async function withRetry(fn, maxRetries = 4, hardDeadlineMs = 60_000) {
+  const startedAt = Date.now();
   let retries = 0;
   while (retries < maxRetries) {
+    const deadlineExceeded = hardDeadlineMs > 0 && (Date.now() - startedAt) >= hardDeadlineMs;
+    if (deadlineExceeded) throw new Error(`[withRetry] deadline ${hardDeadlineMs}ms exceeded (retries=${retries})`);
     try {
       return await fn();
     } catch (err) {
-      if (err.response && err.response.error_code === 429 && err.response.parameters && err.response.parameters.retry_after) {
-        const retryAfter = err.response.parameters.retry_after * 1000;
-        console.log(`[withRetry] Got 429, waiting ${retryAfter}ms...`);
+      if (err && err.response && err.response.error_code === 429 && err.response.parameters && err.response.parameters.retry_after) {
+        const retryAfter = Math.min(60_000, err.response.parameters.retry_after * 1000);
+        if ((Date.now() - startedAt) + retryAfter > hardDeadlineMs && hardDeadlineMs > 0) {
+          throw new Error(`[withRetry] 429 retry_after=${retryAfter} would exceed deadline; retries=${retries}; err=${String(err?.response?.description || err.message).slice(0, 120)}`);
+        }
         await sleep(retryAfter);
         retries++;
-      } else {
-        throw err;
+        continue;
       }
+      if (isTimeoutError(err)) {
+        const backoff = Math.min(8000, 1500 * Math.pow(2, retries));
+        if ((Date.now() - startedAt) + backoff > hardDeadlineMs && hardDeadlineMs > 0) {
+          throw new Error(`[withRetry] timeout retry backoff=${backoff} would exceed deadline; retries=${retries}; err=${String(err.message).slice(0, 120)}`);
+        }
+        await sleep(backoff);
+        retries++;
+        continue;
+      }
+      throw err;
     }
   }
   throw new Error(`Max retries (${maxRetries}) exceeded`);
@@ -80,6 +104,21 @@ async function hasActiveUserbot() {
   }
 }
 
+const HOT_SEND_HARD_TIMEOUT_MS = 45_000;
+const COLD_COPY_HARD_TIMEOUT_MS = 60_000;
+
+function withHardTimeout(promiseMs, label, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`[delivery] ${label || 'task'} hard timeout after ${timeoutMs}ms`));
+    }, timeoutMs);
+    Promise.resolve(promiseMs).then(
+      (v) => { clearTimeout(timer); resolve(v); },
+      (e) => { clearTimeout(timer); reject(e); }
+    );
+  });
+}
+
 async function hotSendMedia(telegram, chatId, row, replyToMessageId) {
   try {
     const botKey = BOT_KEY;
@@ -90,23 +129,41 @@ async function hotSendMedia(telegram, chatId, row, replyToMessageId) {
     const baseExtra = {};
     if (replyToMessageId) baseExtra.reply_to_message_id = replyToMessageId;
 
-    unwrapQueueResult(await enqueueDeliver(async () => {
-      await withRetry(async () => {
-        if (kind === 'photo') {
-          await telegram.sendPhoto(chatId, fid, baseExtra);
-        } else if (kind === 'document') {
-          const extra = { disable_content_type_detection: false, ...baseExtra };
-          await telegram.sendDocument(chatId, fid, extra);
-        } else {
-          const extra = { supports_streaming: true, ...baseExtra };
-          await telegram.sendVideo(chatId, fid, extra);
-        }
-      });
-    }));
+    await withHardTimeout((async () => {
+      unwrapQueueResult(await enqueueDeliver(async () => {
+        await withRetry(async () => {
+          if (kind === 'photo') {
+            await telegram.sendPhoto(chatId, fid, baseExtra);
+          } else if (kind === 'document') {
+            const extra = { disable_content_type_detection: false, ...baseExtra };
+            await telegram.sendDocument(chatId, fid, extra);
+          } else {
+            const extra = { supports_streaming: true, ...baseExtra };
+            await telegram.sendVideo(chatId, fid, extra);
+          }
+        }, 4, HOT_SEND_HARD_TIMEOUT_MS);
+      }));
+    })(), `hot_send_${kind}_${chatId}`, HOT_SEND_HARD_TIMEOUT_MS + 5000);
+
     return { ok: true, via: `hot_send_${kind}` };
   } catch (err) {
+    if (isTimeoutError(err) || (String(err.message || '').startsWith('[delivery] hot_send_') && err.message.includes('hard timeout'))) {
+      return { ok: false, reason: 'hot_send_timeout', error: err, hardFail: false };
+    }
     if (isSkippableTelegramError(err)) {
       return { ok: false, reason: 'chat_skippable', error: err, skippable: true };
+    }
+    if (isBadFileIdentifierError(err)) {
+      try {
+        if (row && row._id) {
+          await Media.updateOne(
+            { _id: row._id },
+            { $unset: { [`bot_file_ids.${BOT_KEY}`]: 1 } }
+          ).catch(() => {});
+          deliveryCache.delete(String(row._id));
+        }
+      } catch (_) {}
+      return { ok: false, reason: 'hot_send_failed_stale_slot', error: err, hardFail: false };
     }
     return { ok: false, reason: 'hot_send_failed', error: err };
   }
@@ -168,25 +225,35 @@ async function coldForwardAndSeed(telegram, chatId, row, replyToMessageId, fileM
     let lastError = null;
     let msg = null;
     try {
-      unwrapQueueResult(await enqueueDeliver(async () => {
-        await withRetry(async () => {
-          msg = await telegram.copyMessage(chatId, row.source.channel_id, row.source.message_id, extra);
-        });
-      }));
+      await withHardTimeout((async () => {
+        unwrapQueueResult(await enqueueDeliver(async () => {
+          await withRetry(async () => {
+            msg = await telegram.copyMessage(chatId, row.source.channel_id, row.source.message_id, extra);
+          }, 3, COLD_COPY_HARD_TIMEOUT_MS);
+        }));
+      })(), `cold_copy_${row.source.channel_id}_${row.source.message_id}_${chatId}`, COLD_COPY_HARD_TIMEOUT_MS + 8000);
     } catch (forwardErr) {
       lastError = forwardErr;
       if (isSkippableTelegramError(forwardErr)) {
         return { ok: false, reason: 'chat_skippable', error: forwardErr, skippable: true };
       }
+      if (isTimeoutError(forwardErr) || (String(forwardErr.message || '').startsWith('[delivery] cold_copy_') && forwardErr.message.includes('hard timeout'))) {
+        return { ok: false, reason: 'cold_copy_timeout', error: forwardErr, hardFail: false };
+      }
       try {
-        unwrapQueueResult(await enqueueDeliver(async () => {
-          await withRetry(async () => {
-            msg = await telegram.forwardMessage(chatId, row.source.channel_id, row.source.message_id, extra);
-          });
-        }));
+        await withHardTimeout((async () => {
+          unwrapQueueResult(await enqueueDeliver(async () => {
+            await withRetry(async () => {
+              msg = await telegram.forwardMessage(chatId, row.source.channel_id, row.source.message_id, extra);
+            }, 3, COLD_COPY_HARD_TIMEOUT_MS);
+          }));
+        })(), `cold_forward_${row.source.channel_id}_${row.source.message_id}_${chatId}`, COLD_COPY_HARD_TIMEOUT_MS + 8000);
       } catch (err) {
         lastError = err;
         msg = null;
+        if (isTimeoutError(err) || (String(err.message || '').startsWith('[delivery] cold_forward_') && err.message.includes('hard timeout'))) {
+          return { ok: false, reason: 'cold_forward_timeout', error: err, hardFail: false };
+        }
       }
     }
 
@@ -217,6 +284,9 @@ async function coldForwardAndSeed(telegram, chatId, row, replyToMessageId, fileM
 
     return { ok: true, via: 'cold_copy_forward', delivered: !!msg };
   } catch (err) {
+    if (isTimeoutError(err) || (String(err.message || '').startsWith('[delivery] cold_') && err.message.includes('hard timeout'))) {
+      return { ok: false, reason: 'cold_timeout', error: err, hardFail: false };
+    }
     if (isSkippableTelegramError(err)) {
       return { ok: false, reason: 'chat_skippable', error: err, skippable: true };
     }
@@ -243,17 +313,32 @@ async function deliverMedia(telegram, chatId, count, { excludeIds = [] } = {}) {
   const delivered = [];
   const usedIds = new Set(excludeIds.map((id) => id.toString()));
   let shouldAbortChat = false;
+  let hardFailStreak = 0;
+  let hardFailTotal = 0;
+  const HARD_FAIL_ABORT_STREAK = 8;
+  const HARD_FAIL_ABORT_TOTAL = 40;
 
   let fileManagerChannelId = null;
   try {
     fileManagerChannelId = await Settings.get('fileManagerChannel');
   } catch (_e) { /* ignore */ }
 
+  const BOT_KEY_LOCAL = BOT_KEY;
+
   while (delivered.length < count && !shouldAbortChat) {
     const filter = { _id: { $nin: Array.from(usedIds) } };
     const available = await Media.countDocuments(filter);
 
     if (available === 0) break;
+
+    if (hardFailStreak >= HARD_FAIL_ABORT_STREAK) {
+      console.error(`[delivery] bailing after ${hardFailStreak} consecutive hard-fails (total fails=${hardFailTotal}); returning ${delivered.length}/${count} for chat=${chatId}`);
+      break;
+    }
+    if (hardFailTotal >= HARD_FAIL_ABORT_TOTAL) {
+      console.error(`[delivery] bailing after ${hardFailTotal} cumulative hard-fails; returning ${delivered.length}/${count} for chat=${chatId}`);
+      break;
+    }
 
     const needed = count - delivered.length;
     const sampleSize = Math.min(Math.max(needed * 40, needed + 80), available);
@@ -271,20 +356,33 @@ async function deliverMedia(telegram, chatId, count, { excludeIds = [] } = {}) {
 
       let sentOk = false;
       let skippableHit = false;
+      let hardFailHit = false;
 
       let res = await hotSendMedia(telegram, chatId, item);
       if (res && res.ok) {
         sentOk = true;
       } else if (res && res.skippable) {
         skippableHit = true;
+      } else if (res && res.hardFail === false) {
+        hardFailHit = true;
       }
 
       if (!sentOk && !skippableHit) {
-        res = await coldForwardAndSeed(telegram, chatId, item, null, fileManagerChannelId);
-        if (res && res.ok) {
-          sentOk = true;
-        } else if (res && res.skippable) {
-          skippableHit = true;
+        const sourceOk = item && item.source &&
+          item.source.channel_id &&
+          item.source.message_id != null &&
+          item.source.channel_id !== '';
+        if (sourceOk) {
+          res = await coldForwardAndSeed(telegram, chatId, item, null, fileManagerChannelId);
+          if (res && res.ok) {
+            sentOk = true;
+            hardFailHit = false;
+          } else if (res && res.skippable) {
+            skippableHit = true;
+            hardFailHit = false;
+          } else if (res && res.hardFail === false) {
+            hardFailHit = true;
+          }
         }
       }
 
@@ -292,6 +390,7 @@ async function deliverMedia(telegram, chatId, count, { excludeIds = [] } = {}) {
         res = await userbotDirectFallback(item, chatId);
         if (res && res.ok) {
           sentOk = true;
+          hardFailHit = false;
         }
       }
 
@@ -304,9 +403,21 @@ async function deliverMedia(telegram, chatId, count, { excludeIds = [] } = {}) {
       if (sentOk) {
         delivered.push(item);
         usedIds.add(itemId);
+        hardFailStreak = 0;
+        try {
+          await Media.updateOne(
+            { _id: item._id },
+            { $set: { last_seen_at: new Date() } }
+          ).catch(() => {});
+        } catch (_) {}
         if (delivered.length === count) break;
       } else {
         usedIds.add(itemId);
+        if (hardFailHit) {
+          hardFailStreak += 1;
+          hardFailTotal += 1;
+          if (hardFailStreak >= HARD_FAIL_ABORT_STREAK || hardFailTotal >= HARD_FAIL_ABORT_TOTAL) break;
+        }
         continue;
       }
     }
