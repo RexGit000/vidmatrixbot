@@ -110,15 +110,28 @@ async function alertChronicShortfall(telegram, adminIdsOrGetAdminIds, {
       adminIds = (Array.isArray(res) ? res : []).map(Number).filter((n) => Number.isFinite(n));
     }
     if (!adminIds.length) return;
-    const text = `⚠️ [${botUsername || 'bot'}] Chronic media shortfall\n`
-      + `user=${userId}\n`
-      + `order=${orderId || 'n/a'}\n`
-      + `promised=${promised}\n`
-      + `delivered=${delivered}\n`
-      + `shortfall=${shortfall}\n`
-      + `after ${MAX_TOTAL_DELIVERY_ATTEMPTS} attempts. Please investigate.`;
+    const shortfallPct = promised > 0 ? Math.round((shortfall / promised) * 100) : 0;
+    const attempts = MAX_TOTAL_DELIVERY_ATTEMPTS;
+    const attemptLine = attempts <= 1
+      ? 'Tried once and still missed some.'
+      : attempts === 2
+      ? 'Tried a 2nd pass top-up and still missed some.'
+      : `Tried ${attempts} times (1 initial + ${attempts - 1} top-up passes) and still missed some.`;
+    const severity = shortfallPct >= 60 ? '🆘 SEVERE' : shortfallPct >= 30 ? '⚠️ WARNING' : '💡 NOTICE';
+    const title = `${severity} ${botUsername || 'bot'} — delivery shortfall`;
+    const text = `${title}\n`
+      + `\n`
+      + `👤 user: \`${userId}\`\n`
+      + `📦 promised : ${promised}\n`
+      + `✅ delivered: ${delivered}\n`
+      + `❌ missing  : ${shortfall} (${shortfallPct}%)\n`
+      + `\n`
+      + `${attemptLine}\n`
+      + `If missing keeps happening, check: stale bot_file_ids, bad Telegram routing, bot not in file channel, DB rows w/o source.message_id, or cluster-wide timeouts.`;
     for (const adminId of adminIds) {
-      try { await telegram.sendMessage(adminId, text).catch(() => {}); } catch (_e) { /* swallow */ }
+      try {
+        await telegram.sendMessage(adminId, text, { parse_mode: 'Markdown' }).catch(() => {});
+      } catch (_e) { /* swallow */ }
     }
   } catch (_e) { /* swallow */ }
 }
