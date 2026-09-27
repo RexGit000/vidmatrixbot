@@ -2,7 +2,7 @@ const { Scenes, Markup } = require('telegraf');
 const { message } = require('telegraf/filters');
 const Package = require('../models/Package');
 const { mainAdminKeyboard } = require('../keyboards/admin');
-const { getSubscriptionDurationText } = require('../services/subscriptionService');
+const { formatCompactNumber } = require('../utils/helpers');
 
 const editPackageScene = new Scenes.BaseScene('EDIT_PACKAGE');
 
@@ -18,9 +18,7 @@ async function showPackageList(ctx) {
   }
   const rows = packages.map((p) => [
     Markup.button.callback(
-      p.type === 'subscription'
-        ? `👑 ${p.name} · ⭐ ${p.stars} · ${getSubscriptionDurationText(p)} / ${p.dailyMediaCount} 🎬 per day [edit]`
-        : `⭐ ${p.stars} Stars → 🎬 ${p.mediaCount} Media [edit]`,
+      `⭐ ${formatCompactNumber(p.stars)} Stars → 🎬 ${formatCompactNumber(p.mediaCount)} Media  [edit]`,
       `edit_pkg:${p._id}`
     ),
   ]);
@@ -43,7 +41,7 @@ editPackageScene.action(/^edit_pkg:(.+)$/, async (ctx) => {
   ctx.scene.state.pkgId = ctx.match[1];
   ctx.scene.state.step  = 'awaiting_stars';
   await ctx.editMessageText(
-    `Editing: *${pkg.name}*\nCurrent cost: ⭐ ${pkg.stars} Stars\n\nEnter new star cost:`,
+    `Editing: *${pkg.name}*\nCurrent cost: ⭐ ${formatCompactNumber(pkg.stars)} Stars\n\nEnter new star cost:`,
     { parse_mode: 'Markdown' }
   );
   await ctx.reply('Send new star amount:', Markup.keyboard([['❌ Cancel']]).resize());
@@ -77,9 +75,7 @@ editPackageScene.on(message('text'), async (ctx) => {
   );
 
   await ctx.reply(
-    pkg.type === 'subscription'
-      ? `✅ *${pkg.name}* updated → ⭐ ${pkg.stars} Stars for ${getSubscriptionDurationText(pkg)} / ${pkg.dailyMediaCount} 🎬 per day.`
-      : `✅ *${pkg.name}* updated → ⭐ ${pkg.stars} Stars for 🎬 ${pkg.mediaCount} Media.`,
+    `✅ *${pkg.name}* updated → ⭐ ${formatCompactNumber(pkg.stars)} Stars for 🎬 ${formatCompactNumber(pkg.mediaCount)} Media.`,
     { parse_mode: 'Markdown' }
   );
   return leave(ctx, '↩️ Back to admin panel.');

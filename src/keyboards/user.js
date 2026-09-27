@@ -1,17 +1,6 @@
 const { Markup } = require('telegraf');
-const { getSubscriptionDurationText } = require('../services/subscriptionService');
-
-function updatesChannelUrl(username) {
-  return username ? `https://t.me/${String(username).replace(/^@/, '')}` : null;
-}
-
-function packageButtonLabel(pkg) {
-  if (pkg.type === 'subscription') {
-    return `👑 ${pkg.name} · ⭐ ${pkg.stars} · ${getSubscriptionDurationText(pkg)} / ${pkg.dailyMediaCount} 🎬 per day`;
-  }
-
-  return `⭐ ${pkg.stars} Stars = ${pkg.mediaCount} Videos`;
-}
+const { getNextTier } = require('../utils/referral');
+const { formatCompactNumber } = require('../utils/helpers');
 
 function mainUserKeyboard(isAdmin = false) {
   const rows = [
@@ -24,22 +13,23 @@ function mainUserKeyboard(isAdmin = false) {
 
 // Colored inline keyboard attached to the /start welcome message (image-2 style).
 // Uses background_color for Telegram Bot API colored button support.
-function startInlineKeyboard(user, packages, isAdmin, memberCount, updatesChannelUsername) {
+function startInlineKeyboard(user, packages, isAdmin, memberCount) {
   const inviteCount = user.inviteCount || 0;
+  const nextTier    = getNextTier(inviteCount);
+  const nextStr     = nextTier
+    ? `Next: ${nextTier.emoji} ${nextTier.name} (${inviteCount}/${nextTier.invites})`
+    : '🏆 Max Tier!';
 
   const rows = [];
 
-  rows.push([{ text: `👥 INVITE FRIENDS | ${inviteCount} referrals`, callback_data: 'start_invite', style: 'success' }]);
+  rows.push([{ text: `👥 INVITE FRIENDS | ${nextStr}`,           callback_data: 'start_invite',   style: 'success' }]);
   rows.push([{ text: `❤️ My Referral Progress (${inviteCount})`, callback_data: 'ref_progress',   style: 'danger'  }]);
 
   for (const pkg of packages) {
-    rows.push([{ text: packageButtonLabel(pkg), callback_data: `buy_pkg:${pkg._id}` }]);
+    rows.push([{ text: `⭐ ${formatCompactNumber(pkg.stars)} Stars = ${formatCompactNumber(pkg.mediaCount)} Videos`, callback_data: `buy_pkg:${pkg._id}` }]);
   }
 
   rows.push([{ text: '⭐ 📊 Referral Leaderboard',               callback_data: 'ref_leaderboard', style: 'primary' }]);
-  if (updatesChannelUsername) {
-    rows.push([{ text: `👉 Join Now: ${updatesChannelUsername}`, url: updatesChannelUrl(updatesChannelUsername) }]);
-  }
 
   if (isAdmin) {
     rows.push([{ text: `👥 Admin View: ${memberCount} Members`, callback_data: 'switch_admin_inline' }]);
@@ -49,22 +39,23 @@ function startInlineKeyboard(user, packages, isAdmin, memberCount, updatesChanne
 }
 
 // Transparent inline keyboard for the My Stats message (image-1 style).
-function statsInlineKeyboard(user, packages, isAdmin, memberCount, updatesChannelUsername) {
+function statsInlineKeyboard(user, packages, isAdmin, memberCount) {
   const inviteCount = user.inviteCount || 0;
+  const nextTier    = getNextTier(inviteCount);
+  const nextStr     = nextTier
+    ? `${nextTier.emoji} ${nextTier.name} (${inviteCount}/${nextTier.invites})`
+    : '🏆 Max Tier!';
 
   const rows = [
-    [Markup.button.callback(`👥 INVITE FRIENDS | ${inviteCount} referrals`, 'start_invite')],
+    [Markup.button.callback(`👥 INVITE FRIENDS | Next: ${nextStr}`, 'start_invite')],
     [Markup.button.callback(`🏆 My Referral Progress (${inviteCount} invite${inviteCount !== 1 ? 's' : ''})`, 'ref_progress')],
   ];
 
   for (const pkg of packages) {
-    rows.push([Markup.button.callback(packageButtonLabel(pkg), `buy_pkg:${pkg._id}`)]);
+    rows.push([Markup.button.callback(`⭐ ${formatCompactNumber(pkg.stars)} Stars = ${formatCompactNumber(pkg.mediaCount)} Premium Videos`, `buy_pkg:${pkg._id}`)]);
   }
 
   rows.push([Markup.button.callback('📊 Referral Leaderboard', 'ref_leaderboard')]);
-  if (updatesChannelUsername) {
-    rows.push([Markup.button.url(`👉 Join Now: ${updatesChannelUsername}`, updatesChannelUrl(updatesChannelUsername))]);
-  }
 
   if (isAdmin) {
     rows.push([Markup.button.callback(`👥 Admin View: ${memberCount} Members`, 'switch_admin_inline')]);
@@ -75,7 +66,10 @@ function statsInlineKeyboard(user, packages, isAdmin, memberCount, updatesChanne
 
 function packagesKeyboard(packages) {
   const rows = packages.map((pkg) => [
-    Markup.button.callback(packageButtonLabel(pkg), `buy_pkg:${pkg._id}`),
+    Markup.button.callback(
+      `⭐ ${formatCompactNumber(pkg.stars)} Stars → 🎬 ${formatCompactNumber(pkg.mediaCount)} Media`,
+      `buy_pkg:${pkg._id}`
+    ),
   ]);
   rows.push([Markup.button.callback('« Back', 'back_to_main')]);
   return Markup.inlineKeyboard(rows);

@@ -14,12 +14,6 @@ async function leave(ctx, text) {
   return ctx.scene.leave();
 }
 
-function nameCompact(user) {
-  if (!user) return 'Unknown';
-  const name = [user.firstName, user.lastName].filter(Boolean).join(' ') || 'Unknown';
-  return user.username ? `${name} (@${user.username})` : name;
-}
-
 async function showUserList(ctx, page = 0) {
   const USER_PAGE_SIZE = 10;
   const total = await User.countDocuments();
@@ -175,139 +169,57 @@ giftMediaScene.on(message('text'), async (ctx) => {
       return leave(ctx, '❌ Session expired. Please try again.');
     }
 
-    ctx.scene.state.step = 'delivering';
-    let holdMessageId = null;
     try {
-      const hold = await ctx.reply(`⏳ Preparing ${count} gift item${count === 1 ? '' : 's'} for ${nameCompact(user)}…`);
-      holdMessageId = hold?.message_id ?? null;
-    } catch (_errHold) {
-      console.warn('[giftMedia] hold reply failed:', _errHold.message);
-    }
+      const result = await deliverWithVerification({
+        telegram: ctx.telegram,
+        chatId: user.telegramId,
+        userId: Number(user.telegramId),
+        finalMediaCount: count,
+        userRecord: user,
+        deliverMediaFn: deliverMedia,
+        adminIdResolver: () => adminCache.getAllSuperAdminIds(),
+        botUsername: process.env.BOT_USERNAME || 'starstomediav2bot',
+      });
 
-    const progressThrottleMs = 5000;
-    let lastProgressAt = 0;
-    let lastProgressDelivered = -1;
+      const promised = result.promised;
+      const actual = result.actualCount;
+      const shortfall = result.shortfall;
 
-    async function updateHoldProgress({ delivered, target, elapsedMs }) {
-      if (holdMessageId == null) return;
-      const now = Date.now();
-      if (delivered === lastProgressDelivered && (now - lastProgressAt) < progressThrottleMs) return;
-      lastProgressAt = now;
-      lastProgressDelivered = delivered;
-      const sec = Math.round(Number(elapsedMs || 0) / 1000);
-      const targetText = target ? ` / ${target}` : '';
-      const text =
-        `⏳ Gift in progress… ${delivered}${targetText} sent` +
-        (sec >= 10 ? ` (${sec}s so far)` : '') +
-        `\nTo: ${nameCompact(user)}`;
-      try {
-        // #region debug-point H3:progress-edit
-        (()=>{const fs=require('fs'),p='.dbg/gift-progress-stuck.env';let u='http://127.0.0.1:7777/event',s='gift-progress-stuck';try{const e=fs.readFileSync(p,'utf8');u=e.match(/DEBUG_SERVER_URL=(.+)/)?.[1]||u;s=e.match(/DEBUG_SESSION_ID=(.+)/)?.[1]||s}catch{}fetch(u,{method:'POST',body:JSON.stringify({sessionId:s,runId:'pre',hypothesisId:'H3',location:'giftMedia.js:updateHoldProgress',msg:'[DEBUG] progress edit call',data:{holdMessageId,delivered,target,text:text.length,sec},ts:Date.now()})}).catch(()=>{})})();
-        // #endregion
-        await ctx.telegram.editMessageText(ctx.chat.id, holdMessageId, null, text)
-          .then(() => {
-            // #region debug-point H3:progress-edit-ok
-            (()=>{const fs=require('fs'),p='.dbg/gift-progress-stuck.env';let u='http://127.0.0.1:7777/event',s='gift-progress-stuck';try{const e=fs.readFileSync(p,'utf8');u=e.match(/DEBUG_SERVER_URL=(.+)/)?.[1]||u;s=e.match(/DEBUG_SESSION_ID=(.+)/)?.[1]||s}catch{}fetch(u,{method:'POST',body:JSON.stringify({sessionId:s,runId:'pre',hypothesisId:'H3',location:'giftMedia.js:updateHoldProgress-ok',msg:'[DEBUG] progress edit success',data:{delivered,target,sec},ts:Date.now()})}).catch(()=>{})})();
-            // #endregion
-          })
-          .catch((editErr) => {
-            // #region debug-point H3:progress-edit-err
-            (()=>{const fs=require('fs'),p='.dbg/gift-progress-stuck.env';let u='http://127.0.0.1:7777/event',s='gift-progress-stuck';try{const e=fs.readFileSync(p,'utf8');u=e.match(/DEBUG_SERVER_URL=(.+)/)?.[1]||u;s=e.match(/DEBUG_SESSION_ID=(.+)/)?.[1]||s}catch{}fetch(u,{method:'POST',body:JSON.stringify({sessionId:s,runId:'pre',hypothesisId:'H3',location:'giftMedia.js:updateHoldProgress-err',msg:'[DEBUG] progress edit err',data:{delivered,target,err:String(editErr?.message||editErr).slice(0,160)},ts:Date.now()})}).catch(()=>{})})();
-            // #endregion
-          });
-      } catch (_e) {}
-    }
-
-    (async () => {
-      let result = null;
-      let fatalErr = null;
-      try {
-        // #region debug-point H1:iife-start
-        (()=>{const fs=require('fs'),p='.dbg/gift-progress-stuck.env';let u='http://127.0.0.1:7777/event',s='gift-progress-stuck';try{const e=fs.readFileSync(p,'utf8');u=e.match(/DEBUG_SERVER_URL=(.+)/)?.[1]||u;s=e.match(/DEBUG_SESSION_ID=(.+)/)?.[1]||s}catch{}fetch(u,{method:'POST',body:JSON.stringify({sessionId:s,runId:'pre',hypothesisId:'H1',location:'giftMedia.js:iife-start',msg:'[DEBUG] gift IIFE starting deliverWithVerification',data:{count:count,userTelegramId:user.telegramId,userId:user.id,holdMessageId,adminChatId:ctx.chat?.id},ts:Date.now()})}).catch(()=>{})})();
-        // #endregion
-        result = await deliverWithVerification({
-          telegram: ctx.telegram,
-          chatId: user.telegramId,
-          userId: Number(user.telegramId),
-          finalMediaCount: count,
-          userRecord: user,
-          deliverMediaFn: (tg, tgt, n, opts) => {
-            const combinedOpts = Object.assign({}, opts || {});
-            if (!combinedOpts.onProgress) {
-              combinedOpts.onProgress = function onProgress(ev, info) {
-                if (ev !== 'batch' && ev !== 'begin' && ev !== 'end') return;
-                try { updateHoldProgress({ delivered: info.delivered || 0, target: info.target || n, elapsedMs: info.elapsedMs || 0 }); } catch (_e) {}
-              };
-            }
-            return deliverMedia(tg, tgt, n, combinedOpts);
-          },
-          adminIdResolver: () => adminCache.getAllSuperAdminIds(),
-          botUsername: process.env.BOT_USERNAME || 'starstomediav2bot',
-        });
-
-        const promised = result.promised;
-        const actual = result.actualCount;
-        if (actual > 0 && actual === promised) {
-          try {
-            await ctx.telegram.sendMessage(user.telegramId, `🎁 You just got ${actual} gifted media from the admin — enjoy!`);
-          } catch (err) {
-            console.error('[giftMedia] Failed to notify target user:', err.message);
-          }
+      if (actual > 0 && actual === promised) {
+        try {
+          const verb = actual === 1 ? 'was' : 'were';
+          await ctx.telegram.sendMessage(
+            user.telegramId,
+            `${actual} media ${verb} gifted to you by the admin, Enjoy🎉`
+          );
+        } catch (err) {
+          console.error('[giftMedia] Failed to notify user:', err.message);
         }
-      } catch (err) {
-        fatalErr = err;
-        console.error('[giftMedia] deliverWithVerification fatal:', err?.stack || String(err));
       }
 
-      let reply;
-      if (fatalErr) {
-        // #region debug-point H1:iife-fatal
-        (()=>{const fs=require('fs'),p='.dbg/gift-progress-stuck.env';let u='http://127.0.0.1:7777/event',s='gift-progress-stuck';try{const e=fs.readFileSync(p,'utf8');u=e.match(/DEBUG_SERVER_URL=(.+)/)?.[1]||u;s=e.match(/DEBUG_SESSION_ID=(.+)/)?.[1]||s}catch{}fetch(u,{method:'POST',body:JSON.stringify({sessionId:s,runId:'pre',hypothesisId:'H1',location:'giftMedia.js:iife-fatal',msg:'[DEBUG] gift fatal err',data:{err:String(fatalErr?.message||fatalErr).slice(0,220),stack:(fatalErr?.stack||'').slice(0,240)},ts:Date.now()})}).catch(()=>{})})();
-        // #endregion
-        reply = `❌ Gift failed to send. ${fatalErr.message ? 'Error: ' + String(fatalErr.message).slice(0, 220) : ''}`;
+      const name = [user.firstName, user.lastName].filter(Boolean).join(' ') || 'Unknown';
+      if (shortfall > 0) {
+        await ctx.reply(
+          `⚠️ Gift had shortfall\nRequested: ${formatCompactNumber(promised)}\nDelivered: ${formatCompactNumber(actual)}\nShortfall: ${shortfall}\nUser NOT notified (shortfall gate).\nTarget: ${name}${user.username ? ` (@${user.username})` : ''}`,
+          { ...mainAdminKeyboard() }
+        );
+      } else if (actual === 0) {
+        await ctx.reply(
+          `❌ Gift delivered zero media items.\nRequested: ${formatCompactNumber(promised)}\nTarget: ${name}${user.username ? ` (@${user.username})` : ''}`,
+          { ...mainAdminKeyboard() }
+        );
       } else {
-        const promised = result.promised;
-        const actual = result.actualCount;
-        const shortfall = result.shortfall;
-        // #region debug-point H1:iife-done
-        (()=>{const fs=require('fs'),p='.dbg/gift-progress-stuck.env';let u='http://127.0.0.1:7777/event',s='gift-progress-stuck';try{const e=fs.readFileSync(p,'utf8');u=e.match(/DEBUG_SERVER_URL=(.+)/)?.[1]||u;s=e.match(/DEBUG_SESSION_ID=(.+)/)?.[1]||s}catch{}fetch(u,{method:'POST',body:JSON.stringify({sessionId:s,runId:'pre',hypothesisId:'H1',location:'giftMedia.js:iife-done',msg:'[DEBUG] gift IIFE done dWV result',data:{promised,actual,shortfall,attempts:result.attempts,lastReturnedCount:result.lastReturnedCount},ts:Date.now()})}).catch(()=>{})})();
-        // #endregion
-        if (shortfall > 0) {
-          reply =
-            `⚠️ Not enough media in the pool to fill this gift.\n` +
-            `Asked for ${promised} but only ${actual} were available.\n` +
-            `(${shortfall} missing. We did NOT message the user.)\n` +
-            `To: ${nameCompact(user)}`;
-        } else if (actual === 0) {
-          reply =
-            `⚠️ Couldn't send any gift media right now.\n` +
-            `Asked for ${promised} but 0 were delivered.\n` +
-            `To: ${nameCompact(user)}`;
-        } else {
-          reply =
-            `✅ Gift sent.\n` +
-            `${actual} of ${promised} delivered to ${nameCompact(user)}.`;
-        }
+        await ctx.reply(
+          `✅ Gift sent!\nDelivered ${formatCompactNumber(actual)} / ${formatCompactNumber(promised)} media items to ${name}${user.username ? ` (@${user.username})` : ''}`,
+          { ...mainAdminKeyboard() }
+        );
       }
-
-      if (holdMessageId != null) {
-        try { await ctx.deleteMessage(holdMessageId); } catch (_e) {}
-      }
-      try { await ctx.reply(reply, { ...mainAdminKeyboard() }); }
-      catch (replyErr) {
-        console.error('[giftMedia] final admin reply failed:', replyErr.message);
-      }
-      try { ctx.scene.leave(); } catch (_e) {}
-    })().catch((e) => {
-      console.error('[giftMedia] IIFE outer catch:', e?.stack || String(e));
-      if (holdMessageId != null) {
-        try { ctx.deleteMessage(holdMessageId).catch(() => {}); } catch (_e2) {}
-      }
-      try { ctx.reply('❌ Gift failed. Check logs.', { ...mainAdminKeyboard() }).catch(() => {}); }
-      catch (_e3) {}
-      try { ctx.scene.leave(); } catch (_e4) {}
-    });
-    return;
+      return ctx.scene.leave();
+    } catch (err) {
+      console.error('[giftMedia]', err);
+      await ctx.reply('❌ Failed to deliver media. Check logs.', { ...mainAdminKeyboard() });
+      return ctx.scene.leave();
+    }
   }
 });
 

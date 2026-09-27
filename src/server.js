@@ -1,27 +1,23 @@
 require('dotenv').config({ override: true });
 const express  = require('express');
 const connectDB    = require('./db');
-require('./models/Media');
-require('./models/UserbotAccount');
 const Admin        = require('./models/Admin');
 const Settings     = require('./models/Settings');
 const User         = require('./models/User');
 const Order        = require('./models/Order');
-const Package      = require('./models/Package');
-const { adminCache } = require('./cache');
+require('./models/Media');
+require('./models/UserbotAccount');
+const { adminCache }   = require('./cache');
 const botState     = require('./services/botState');
 const bot          = require('./bot');
 const { syncMediaPool } = require('./services/syncService');
-const { runDailySubscriptionCycleIfNeeded, activateSubscription, buildSubscriptionConfirmation } = require('./services/subscriptionService');
-const { runWeeklyCycleIfNeeded } = require('./services/weeklyCycleService');
-const { deliverMedia, rememberDeliveredMedia } = require('./services/mediaService');
+const { deliverMedia } = require('./services/mediaService');
 const { seedAdmins } = require('./seed');
 const { deliverWithVerification } = require('./utils/mediaSendObserver');
 
 const SYNC_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
-const SCHEDULE_INTERVAL_MS = 60 * 1000; // 1 minute
 
-const PORT = Number(process.env.port || process.env.PORT || 3002);
+const PORT = Number(process.env.port || process.env.PORT || 3004);
 
 process.on('uncaughtException', (err) => {
   console.error('[uncaughtException]', err);
@@ -177,35 +173,6 @@ app.post('/api/payment-success', async (req, res) => {
 
     (async () => {
       try {
-        const pkg = order.packageId
-          ? await Package.findById(order.packageId).lean()
-          : null;
-        const isSubscription = pkg && pkg.type === 'subscription';
-        const user = await User.findOne({ telegramId: Number(userId) });
-
-        if (isSubscription) {
-          if (!pkg) {
-            await bot.telegram.sendMessage(
-              chatId,
-              '⚠️ Payment received, but the subscription package could not be found. Please contact support.'
-            ).catch(() => {});
-            return;
-          }
-          if (!user) {
-            await bot.telegram.sendMessage(
-              chatId,
-              '⚠️ Payment received, but your user record is missing. Please send /start and contact support.'
-            ).catch(() => {});
-            return;
-          }
-          const subscription = await activateSubscription(user, pkg, new Date());
-          await bot.telegram.sendMessage(
-            chatId,
-            buildSubscriptionConfirmation(subscription),
-          );
-          return;
-        }
-
         await bot.telegram.sendMessage(
           chatId,
           `✅ *Payment Confirmed!*\n\n` +
@@ -215,6 +182,25 @@ app.post('/api/payment-success', async (req, res) => {
           { parse_mode: 'Markdown' }
         );
 
+        const user = await User.findOne({ telegramId: Number(userId) });
+
+        function rememberBatchInline(batchItems) {
+          if (!user || !Array.isArray(batchItems) || !batchItems.length) return false;
+          if (!Array.isArray(user.receivedMedia)) user.receivedMedia = [];
+          const existingSet = new Set(user.receivedMedia.map((id) => id.toString()));
+          let changed = false;
+          for (const item of batchItems) {
+            if (!item || item._id == null) continue;
+            const id = String(item._id);
+            if (!existingSet.has(id)) {
+              user.receivedMedia.push(item._id);
+              existingSet.add(id);
+              changed = true;
+            }
+          }
+          return changed;
+        }
+
         const result = await deliverWithVerification({
           telegram: bot.telegram,
           chatId,
@@ -223,17 +209,17 @@ app.post('/api/payment-success', async (req, res) => {
           finalMediaCount,
           userRecord: user,
           deliverMediaFn: deliverMedia,
-          rememberDeliveredMediaFn: rememberDeliveredMedia,
+          rememberDeliveredMediaFn: rememberBatchInline,
           onNewBatchDelivered: async (items) => {
             if (user && Array.isArray(items) && items.length) {
-              const alreadyChanged = rememberDeliveredMedia(user, items);
-              if (alreadyChanged) {
+              const changed = rememberBatchInline(items);
+              if (changed) {
                 try { await user.save(); } catch (_e) { /* swallow */ }
               }
             }
           },
           adminIdResolver: () => adminCache.getAllSuperAdminIds(),
-          botUsername: process.env.BOT_USERNAME || 'vidmatrixbot',
+          botUsername: process.env.BOT_USERNAME || 'starstomediabot',
         });
 
         if (result.rememberChanged && user) {
@@ -267,8 +253,6 @@ app.use((err, _req, res, _next) => {
   res.status(500).json({ error: 'Internal server error' });
 });
 
-app.listen(PORT, () => console.log(`HTTP server listening on port ${PORT}`));
-
 // ── Boot ──────────────────────────────────────────────────────────────────────
 
 async function boot() {
@@ -277,13 +261,10 @@ async function boot() {
 
     await seedAdmins();
 
-    // Load admin cache into memory
     const admins = await Admin.find().lean();
     adminCache.set(admins);
     console.log(`Admin cache loaded: ${admins.length} admin(s)`);
 
-    // Load bot on/off state. For safety always boot ENABLED (never get stuck disabled).
-    // Admins can still toggle via panel after boot if needed.
     const savedBotState = await Settings.get('botEnabled');
     if (savedBotState === false) {
       await Settings.set('botEnabled', true);
@@ -295,11 +276,11 @@ async function boot() {
     botState.set(true);
     console.log('Bot state: enabled');
 
-    // Verify token + get bot identity (plain API call, works before launch)
+    app.listen(PORT, () => console.log(`HTTP server listening on port ${PORT}`));
+
     const me = await bot.telegram.getMe();
     console.log(`Bot connected: @${me.username} (ID: ${me.id})`);
 
-    // Clear any stale webhook from prior deployments, then start long-polling
     try {
       const hookInfo = await bot.telegram.getWebhookInfo();
       if (hookInfo && hookInfo.url) {
@@ -310,41 +291,18 @@ async function boot() {
       console.warn('[boot] webhook cleanup skipped:', err.message);
     }
 
-    // Register bot command menu (the "/" list users see in Telegram)
     await bot.telegram.setMyCommands([
-      { command: 'start',  description: '🏠 Welcome & weekly leaderboard'  },
+      { command: 'start',  description: '🏠 Welcome & referral rewards'  },
       { command: 'invite', description: '🔗 Get your referral link'       },
-      { command: 'stats',  description: '📊 Your stats & weekly progress'   },
+      { command: 'stats',  description: '📊 Your stats & tier progress'   },
     ]);
     console.log('Bot commands registered.');
 
-    // Media pool sync — run once on boot, then every 30 minutes
     syncMediaPool(bot).catch((err) => console.error('[sync] Boot run failed:', err));
     setInterval(() => {
       syncMediaPool(bot).catch((err) => console.error('[sync] Periodic run failed:', err));
     }, SYNC_INTERVAL_MS);
 
-    // Time-based jobs — use IST day/week helpers inside the services
-    const runScheduledJobs = async () => {
-      try {
-        await runDailySubscriptionCycleIfNeeded(bot);
-      } catch (err) {
-        console.error('[schedule] daily subscription cycle failed:', err);
-      }
-
-      try {
-        await runWeeklyCycleIfNeeded(bot);
-      } catch (err) {
-        console.error('[schedule] weekly cycle failed:', err);
-      }
-    };
-
-    runScheduledJobs().catch((err) => console.error('[schedule] boot run failed:', err));
-    setInterval(() => {
-      runScheduledJobs().catch((err) => console.error('[schedule] periodic run failed:', err));
-    }, SCHEDULE_INTERVAL_MS);
-
-    // Start long-polling — promise never resolves (infinite loop), so don't await
     bot.launch().catch((err) => {
       if (err?.message !== 'Aborted') console.error('[bot]', err);
     });

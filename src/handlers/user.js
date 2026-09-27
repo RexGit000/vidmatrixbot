@@ -3,20 +3,14 @@ const User    = require('../models/User');
 const Media   = require('../models/Media');
 const Package = require('../models/Package');
 const Order   = require('../models/Order');
-const Settings = require('../models/Settings');
 const { adminCache } = require('../cache');
 const { POINTS_PER_MEDIA } = require('../constants');
+const { REFERRAL_TIERS, getCurrentTier, getNextTier } = require('../utils/referral');
 const { mainUserKeyboard, packagesKeyboard, statsInlineKeyboard } = require('../keyboards/user');
 const { mainAdminKeyboard } = require('../keyboards/admin');
 const { buildAdminStats } = require('../utils/stats');
-const { deliverMedia, rememberDeliveredMedia } = require('../services/mediaService');
-const { getWeeklyLeaderboard, getUserWeeklyStanding, buildLeaderboardMessage } = require('../services/leaderboardService');
-const {
-  buildSubscriptionSummary,
-  hasActiveSubscription,
-  getSubscriptionDurationText,
-} = require('../services/subscriptionService');
-const { formatISTDate } = require('../utils/time');
+const { deliverMedia } = require('../services/mediaService');
+const { formatCompactNumber } = require('../utils/helpers');
 
 async function unseenCount(user) {
   if (!user.receivedMedia?.length) return await Media.countDocuments();
@@ -30,7 +24,11 @@ async function executeRedemption(ctx, bot, user, qty, mode) {
   const cost = delivered * POINTS_PER_MEDIA;
 
   user.points = (user.points || 0) - cost;
-  rememberDeliveredMedia(user, items);
+  const existingSet = new Set((user.receivedMedia || []).map((id) => id.toString()));
+  for (const item of items) {
+    const id = item._id.toString();
+    if (!existingSet.has(id)) { user.receivedMedia.push(item._id); existingSet.add(id); }
+  }
   await user.save();
 
   return { delivered, cost };
@@ -44,12 +42,12 @@ module.exports = (bot) => {
       const botUsername = ctx.botInfo.username;
       const refLink     = `https://t.me/${botUsername}?start=${ctx.from.id}`;
       const inviteCount = user?.inviteCount || 0;
-      const weeklyStanding = await getUserWeeklyStanding(ctx.from.id);
+      const nextTier    = getNextTier(inviteCount);
+      const nextStr     = nextTier
+        ? `📊 Next: ${nextTier.emoji} *${nextTier.name}* — ${inviteCount}/${nextTier.invites} invites`
+        : '🏆 *Max tier reached!*';
       await ctx.reply(
-        `🔗 *Your Referral Link:*\n\`${refLink}\`\n\n` +
-        `👥 Total Referrals: *${inviteCount}*\n` +
-        `🏆 Weekly Rank: *${weeklyStanding.rank ? `#${weeklyStanding.rank}` : '#--'}*\n\n` +
-        `Share and climb this week's leaderboard!`,
+        `🔗 *Your Referral Link:*\n\`${refLink}\`\n\n${nextStr}\n\nShare and earn FREE videos for every friend who joins! 🎁`,
         { parse_mode: 'Markdown' }
       );
     } catch (err) {
@@ -67,33 +65,30 @@ module.exports = (bot) => {
       const points      = user.points || 0;
       const inviteCount = user.inviteCount || 0;
       const redeemable  = Math.floor(points / POINTS_PER_MEDIA);
-      const weeklyStanding = await getUserWeeklyStanding(ctx.from.id);
-      const subscriptionSummary = buildSubscriptionSummary(user.subscription);
+      const curTier     = getCurrentTier(inviteCount);
+      const nextTier    = getNextTier(inviteCount);
 
       let text =
         `📊 *My Stats*\n\n` +
         `👥 Invites: *${inviteCount}*\n` +
-        `🏆 Weekly Rank: *${weeklyStanding.rank ? `#${weeklyStanding.rank}` : '#--'}* (${weeklyStanding.weeklyReferrals} weekly referrals)\n` +
         `🌟 Points: *${points}* (${redeemable} media redeemable)\n` +
-        `💎 Subscription: *${subscriptionSummary}*\n` +
-        `📅 Joined: ${user.createdAt.toDateString()}`;
-
-      if (hasActiveSubscription(user.subscription)) {
-        text += `\n\n👑 *Active VIP Plan*\n`;
-        text += `Plan: *${user.subscription.packageName}*\n`;
-        text += `Plan details: *${getSubscriptionDurationText(user.subscription)} / ${user.subscription.dailyMediaCount} 🎬 per day*\n`;
-        text += `Expires: *${formatISTDate(user.subscription.expiresAt)}*`;
+        `📅 Joined: ${user.createdAt.toDateString()}\n\n` +
+        `🏆 *Referral Progress*\n`;
+      if (curTier) text += `Current: ${curTier.emoji} *${curTier.name}*\n`;
+      if (nextTier) {
+        const needed = nextTier.invites - inviteCount;
+        text += `Next: ${nextTier.emoji} *${nextTier.name}* — ${inviteCount}/${nextTier.invites}\n`;
+        text += `\n⭐ Invite *${needed}* more to unlock *${nextTier.reward}* free videos!`;
+      } else {
+        text += '🎊 *Max tier reached!*';
       }
 
-      const [packages, updatesChannelUsername] = await Promise.all([
-        Package.find({ isActive: true }).sort('order'),
-        Settings.get('updatesChannelUsername'),
-      ]);
+      const packages    = await Package.find({ isActive: true }).sort('order').limit(3);
       const isAdmin     = adminCache.isAdmin(ctx.from.id, ctx.from.username);
       const memberCount = isAdmin ? await User.countDocuments() : 0;
       await ctx.reply(text, {
         parse_mode: 'Markdown',
-        ...statsInlineKeyboard(user, packages, isAdmin, memberCount, updatesChannelUsername),
+        ...statsInlineKeyboard(user, packages, isAdmin, memberCount),
       });
     } catch (err) {
       if (err?.response?.error_code === 403) return;
@@ -108,13 +103,16 @@ module.exports = (bot) => {
       const botUsername = ctx.botInfo.username;
       const refLink = `https://t.me/${botUsername}?start=${ctx.from.id}`;
       const inviteCount = user?.inviteCount || 0;
-      const weeklyStanding = await getUserWeeklyStanding(ctx.from.id);
+      const nextTier = getNextTier(inviteCount);
+
+      const nextStr = nextTier
+        ? `📊 Next: ${nextTier.emoji} *${nextTier.name}* — ${inviteCount}/${nextTier.invites} invites`
+        : '🏆 *Max tier reached!*';
 
       await ctx.reply(
         `🔗 *Your Referral Link:*\n\`${refLink}\`\n\n` +
-        `👥 Total Referrals: *${inviteCount}*\n` +
-        `🏆 Weekly Rank: *${weeklyStanding.rank ? `#${weeklyStanding.rank}` : '#--'}*\n\n` +
-        `Share this link and climb the weekly leaderboard!`,
+        `${nextStr}\n\n` +
+        `Share this link and earn FREE videos when friends join! 🎁`,
         { parse_mode: 'Markdown' }
       );
     } catch (err) {
@@ -133,34 +131,41 @@ module.exports = (bot) => {
       const points      = user.points || 0;
       const inviteCount = user.inviteCount || 0;
       const redeemable  = Math.floor(points / POINTS_PER_MEDIA);
-      const weeklyStanding = await getUserWeeklyStanding(ctx.from.id);
-      const subscriptionSummary = buildSubscriptionSummary(user.subscription);
+      const claimed     = new Set(user.claimedTiers || []);
+      const curTier     = getCurrentTier(inviteCount);
+      const nextTier    = getNextTier(inviteCount);
 
       let text =
         `📊 *My Stats*\n\n` +
         `👥 Invites: *${inviteCount}*\n` +
-        `🏆 Weekly Rank: *${weeklyStanding.rank ? `#${weeklyStanding.rank}` : '#--'}* (${weeklyStanding.weeklyReferrals} weekly referrals)\n` +
         `🌟 Points: *${points}* (${redeemable} media redeemable)\n` +
-        `💎 Subscription: *${subscriptionSummary}*\n` +
-        `📅 Joined: ${user.createdAt.toDateString()}`;
+        `📅 Joined: ${user.createdAt.toDateString()}\n\n` +
+        `🏆 *Referral Progress*\n`;
 
-      if (hasActiveSubscription(user.subscription)) {
-        text += `\n\n👑 *Active VIP Plan*\n`;
-        text += `Plan: *${user.subscription.packageName}*\n`;
-        text += `Plan details: *${getSubscriptionDurationText(user.subscription)} / ${user.subscription.dailyMediaCount} 🎬 per day*\n`;
-        text += `Expires: *${formatISTDate(user.subscription.expiresAt)}*`;
+      if (curTier) text += `Current Tier: ${curTier.emoji} *${curTier.name}*\n`;
+      else         text += `No tier yet — invite *2* friends to unlock Bronze!\n`;
+
+      if (nextTier) {
+        const needed = nextTier.invites - inviteCount;
+        text += `Next Tier: ${nextTier.emoji} *${nextTier.name}* (${inviteCount}/${nextTier.invites} invites)\n`;
+        text += `\n⭐ Invite *${needed}* more friend${needed !== 1 ? 's' : ''} to reach *${nextTier.name}* and unlock *${nextTier.reward}* free videos!`;
+      } else {
+        text += `🎊 *Max tier reached!* You're a Legend!\n`;
       }
 
-      const [packages, updatesChannelUsername] = await Promise.all([
-        Package.find({ isActive: true }).sort('order'),
-        Settings.get('updatesChannelUsername'),
-      ]);
+      const claimedList = REFERRAL_TIERS.filter((t) => claimed.has(t.id));
+      if (claimedList.length) {
+        text += `\n\n✅ *Earned Tier Rewards:*\n`;
+        text += claimedList.map((t) => `${t.emoji} ${t.name}: +${t.reward} free videos`).join('\n');
+      }
+
+      const packages   = await Package.find({ isActive: true }).sort('order').limit(3);
       const isAdmin    = adminCache.isAdmin(ctx.from.id, ctx.from.username);
       const memberCount = isAdmin ? await User.countDocuments() : 0;
 
       await ctx.reply(text, {
         parse_mode: 'Markdown',
-        ...statsInlineKeyboard(user, packages, isAdmin, memberCount, updatesChannelUsername),
+        ...statsInlineKeyboard(user, packages, isAdmin, memberCount),
       });
     } catch (err) {
       if (err?.response?.error_code === 403) return;
@@ -174,7 +179,7 @@ module.exports = (bot) => {
     try {
       const packages = await Package.find({ isActive: true }).sort('order');
       if (!packages.length) { await ctx.reply('No packages available right now. Check back later!'); return; }
-      await ctx.reply('Choose a media pack or VIP subscription:', packagesKeyboard(packages));
+      await ctx.reply('Choose a media pack:', packagesKeyboard(packages));
     } catch (err) {
       if (err?.response?.error_code === 403) return;
       console.error('[buy with stars]', err.message);
@@ -323,19 +328,12 @@ module.exports = (bot) => {
       const pkg = await Package.findById(ctx.match[1]);
       if (!pkg) { await ctx.answerCbQuery('Package not found.', true); return; }
 
-      const isSub = pkg.type === 'subscription';
-      const mediaCount = isSub ? (pkg.dailyMediaCount || 0) : pkg.mediaCount;
-      const title = isSub ? `${pkg.name} Subscription` : `${pkg.mediaCount} Media Pack`;
-      const desc = isSub
-        ? `${getSubscriptionDurationText(pkg)} / ${pkg.dailyMediaCount} media per day.`
-        : `Get ${pkg.mediaCount} exclusive media items instantly!`;
-
       const order = await Order.create({
         userId: ctx.from.id,
         chatId: ctx.chat.id,
         packageId: pkg._id,
         amount: pkg.stars,
-        mediaCount: mediaCount,
+        mediaCount: pkg.mediaCount,
         packageName: pkg.name,
       });
 
@@ -344,8 +342,8 @@ module.exports = (bot) => {
       const paymentLink = `https://t.me/${nextPaymentBotUsername()}?start=${deepLinkPayload}`;
 
       const sent = await ctx.reply(
-        `📦 *${title}*\n\n` +
-        `${desc}\n\n` +
+        `📦 *${formatCompactNumber(pkg.mediaCount)} Media Pack*\n\n` +
+        `Get ${formatCompactNumber(pkg.mediaCount)} exclusive media items instantly!\n\n` +
         `💰 Price: *${pkg.stars} Stars* ⭐\n\n` +
         `🔗 Click the button below to complete payment securely via our Payment Bot.`,
         {
@@ -393,7 +391,7 @@ module.exports = (bot) => {
         await ctx.answerCbQuery('No packages available right now.', true);
         return;
       }
-      await ctx.reply('🎁 *Choose a Media Pack or VIP Plan:*', {
+      await ctx.reply('🎁 *Choose a Package:*', {
         parse_mode: 'Markdown',
         ...packagesKeyboard(packages),
       });
@@ -411,13 +409,15 @@ module.exports = (bot) => {
       const botUsername = ctx.botInfo.username;
       const refLink     = `https://t.me/${botUsername}?start=${ctx.from.id}`;
       const inviteCount = user?.inviteCount || 0;
-      const weeklyStanding = await getUserWeeklyStanding(ctx.from.id);
+      const nextTier    = getNextTier(inviteCount);
+
+      const nextStr = nextTier
+        ? `📊 Next: ${nextTier.emoji} *${nextTier.name}* — ${inviteCount}/${nextTier.invites} invites`
+        : '🏆 *Max tier reached!*';
 
       await ctx.reply(
-        `🔗 *Your Referral Link:*\n\`${refLink}\`\n\n` +
-        `👥 Total Referrals: *${inviteCount}*\n` +
-        `🏆 Weekly Rank: *${weeklyStanding.rank ? `#${weeklyStanding.rank}` : '#--'}*\n\n` +
-        `Share this link and climb the weekly leaderboard!`,
+        `🔗 *Your Referral Link:*\n\`${refLink}\`\n\n${nextStr}\n\n` +
+        `Share this link and earn FREE videos when friends join! 🎁`,
         {
           parse_mode: 'Markdown',
           ...Markup.inlineKeyboard([[Markup.button.callback('🗑 Close', 'close_message')]]),
@@ -435,14 +435,27 @@ module.exports = (bot) => {
       await ctx.answerCbQuery();
       const user = await User.findOne({ telegramId: ctx.from.id });
       const inviteCount = user?.inviteCount || 0;
-      const weeklyStanding = await getUserWeeklyStanding(ctx.from.id);
+      const claimed     = new Set(user?.claimedTiers || []);
+      const curTier     = getCurrentTier(inviteCount);
+      const nextTier    = getNextTier(inviteCount);
+
+      const tierLines = REFERRAL_TIERS.map((t) => {
+        const done   = claimed.has(t.id);
+        const status = done ? '✅' : (inviteCount >= t.invites ? '🔓' : '⬜');
+        return `${status} ${t.emoji} *${t.name}*: ${t.invites} invites → ${t.reward} free videos`;
+      });
+
+      let progressStr = `👥 Total Invites: *${inviteCount}*\n`;
+      if (curTier)  progressStr += `🏆 Current: ${curTier.emoji} *${curTier.name}*\n`;
+      if (nextTier) {
+        const needed = nextTier.invites - inviteCount;
+        progressStr += `📊 Next: ${nextTier.emoji} *${nextTier.name}* — invite *${needed}* more!`;
+      } else {
+        progressStr += '🎊 *Max tier reached!*';
+      }
 
       await ctx.reply(
-        `🏆 *Referral Progress*\n\n` +
-        `👥 Total Referrals: *${inviteCount}*\n` +
-        `🏆 Weekly Rank: *${weeklyStanding.rank ? `#${weeklyStanding.rank}` : '#--'}*\n` +
-        `📈 Weekly Referrals: *${weeklyStanding.weeklyReferrals}*\n\n` +
-        `Weekly rewards are based only on the current leaderboard cycle.`,
+        `🏆 *Referral Progress*\n\n${progressStr}\n\n*All Tiers:*\n${tierLines.join('\n')}`,
         {
           parse_mode: 'Markdown',
           ...Markup.inlineKeyboard([[Markup.button.callback('🗑 Close', 'close_message')]]),
@@ -458,18 +471,29 @@ module.exports = (bot) => {
   bot.action('ref_leaderboard', async (ctx) => {
     try {
       await ctx.answerCbQuery();
-      const { entries } = await getWeeklyLeaderboard({ limit: 20, period: 'current' });
+      const top = await User.find({ inviteCount: { $gt: 0 } })
+        .sort({ inviteCount: -1 })
+        .limit(10)
+        .lean();
 
-      if (!entries.length) {
+      if (!top.length) {
         await ctx.reply(
-          '🏆 No weekly referrals yet! Be the first to invite friends and climb the leaderboard!',
+          '🏆 No referrals yet! Be the first to invite friends and climb the leaderboard!',
           Markup.inlineKeyboard([[Markup.button.callback('🗑 Close', 'close_message')]])
         );
         return;
       }
 
+      const medals = ['🥇', '🥈', '🥉'];
+      const lines  = top.map((u, i) => {
+        const medal    = medals[i] || `${i + 1}.`;
+        const name     = u.firstName || 'User';
+        const uname    = u.username  ? ` (@${u.username})` : '';
+        return `${medal} ${name}${uname} — *${u.inviteCount}* invite${u.inviteCount !== 1 ? 's' : ''}`;
+      });
+
       await ctx.reply(
-        buildLeaderboardMessage(entries),
+        `🏆 *Referral Leaderboard*\n\n${lines.join('\n')}`,
         {
           parse_mode: 'Markdown',
           ...Markup.inlineKeyboard([[Markup.button.callback('🗑 Close', 'close_message')]]),
