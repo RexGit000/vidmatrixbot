@@ -1,10 +1,8 @@
 const User    = require('../models/User');
 const Package = require('../models/Package');
-const Settings = require('../models/Settings');
 const { adminCache } = require('../cache');
-const { getUserWeeklyStanding } = require('../services/leaderboardService');
-const { sendQueuedMessage } = require('../services/mediaService');
-const { buildSubscriptionSummary } = require('../services/subscriptionService');
+const { POINTS_PER_MEDIA } = require('../constants');
+const { checkAndAwardTiers, buildTiersList } = require('../utils/referral');
 const { mainUserKeyboard, startInlineKeyboard } = require('../keyboards/user');
 const { mainAdminKeyboard } = require('../keyboards/admin');
 const { buildAdminStats } = require('../utils/stats');
@@ -39,19 +37,26 @@ module.exports = (bot) => {
             await user.save();
 
             referrer.inviteCount += 1;
-            referrer.referralEvents.push({
-              referredUserId: id,
-              joinedAt: new Date(),
-            });
+            referrer.points = (referrer.points || 0) + 1;
+
+            // Check and award any newly unlocked referral tiers
+            const newTiers = checkAndAwardTiers(referrer);
             await referrer.save();
 
             const joinerName = first_name + (username ? ` (@${username})` : '');
-            const refMsg =
+            const redeemable = Math.floor(referrer.points / POINTS_PER_MEDIA);
+
+            let refMsg =
               `👥 *New referral!*\n${joinerName} joined using your link.\n\n` +
               `Total invites: *${referrer.inviteCount}*\n` +
-              `🏆 Weekly leaderboard tracking has been updated.`;
+              `Points: *${referrer.points}* (${redeemable} media redeemable)`;
 
-            sendQueuedMessage(ctx.telegram, referrerId, refMsg, { parse_mode: 'Markdown' }).catch(() => {});
+            if (newTiers.length) {
+              refMsg += '\n\n🎉 *Tier Unlocked!*\n' +
+                newTiers.map((t) => `${t.emoji} ${t.name}: +${t.reward} free videos!`).join('\n');
+            }
+
+            ctx.telegram.sendMessage(referrerId, refMsg, { parse_mode: 'Markdown' }).catch(() => {});
           }
         }
       }
@@ -68,37 +73,19 @@ module.exports = (bot) => {
       }
 
       // User mode — show welcome with referral tiers and colored inline keyboard
-      const [packages, updatesChannelUsername, weeklyStanding] = await Promise.all([
-        Package.find({ isActive: true }).sort('order'),
-        Settings.get('updatesChannelUsername'),
-        getUserWeeklyStanding(id),
-      ]);
+      const packages   = await Package.find({ isActive: true }).sort('order');
       const memberCount = isAdmin ? await User.countDocuments() : 0;
-      const weeklyRankText = weeklyStanding.rank ? `#${weeklyStanding.rank}` : '#--';
 
       const welcomeText =
         `❤️ Welcome to the Premium Video Club! 👋\n\n` +
-        `🔥 *Invite friends and compete weekly!*\n\n` +
-        `📊 *Your Account*\n` +
-        `👥 Referrals: *${user.inviteCount || 0}*\n` +
-        `🏆 Weekly Rank: *${weeklyRankText}*\n` +
-        `💎 Membership: *${buildSubscriptionSummary(user.subscription)}*\n\n` +
-        `🏆 *Weekly Championship*\n` +
-        `🥇 #1 = 700 videos\n` +
-        `   + Champion Badge (7 Days)\n` +
-        `🥈 #2 = 600 videos\n` +
-        `   + Elite Badge (7 Days)\n` +
-        `🥉 #3 = 500 videos\n` +
-        `   + Promoter Badge (7 Days)\n` +
-        `🏅 #4-5 = 230 videos\n` +
-        `🏅 #6-10 = 170 videos\n` +
-        `🏅 #11-20 = 15 videos\n\n` +
-        `⭐ Start inviting and climb the leaderboard! ⭐`;
+        `🔥 *Invite friends and earn FREE premium videos!*\n\n` +
+        `👥 *Referral Rewards:*\n${buildTiersList()}\n\n` +
+        `⭐ Start inviting and unlock your rewards! ⭐`;
 
       await ctx.reply(welcomeText, {
         parse_mode: 'Markdown',
         ...mainUserKeyboard(isAdmin),
-        ...startInlineKeyboard(user, packages, isAdmin, memberCount, updatesChannelUsername),
+        ...startInlineKeyboard(user, packages, isAdmin, memberCount),
       });
     } catch (err) {
       if (err?.response?.error_code === 403) return;

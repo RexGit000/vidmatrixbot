@@ -4,9 +4,6 @@ const UserbotAccount = require('../models/UserbotAccount');
 const Settings = require('../models/Settings');
 const { deliveryCache } = require('../cache');
 const { enqueueDeliver } = require('./queue');
-const { TelegramClient } = require('telegram');
-const { StringSession } = require('telegram/sessions');
-const { Api } = require('telegram/tl');
 
 const BOT_KEY = String(process.env.CURRENT_BOT_KEY || (process.env.BOT_TOKEN || '').split(':')[0] || 'default').trim();
 
@@ -14,285 +11,20 @@ const pendingPromiseCache = new LRUCache({ max: 1000, ttl: 60 * 1000 });
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-let _userbotClientSingleton = null;
-let _userbotClientAccountId = null;
-let _userbotClientInitLock = null;
-async function getUserbotClient() {
-  if (_userbotClientSingleton && _userbotClientAccountId) {
-    return _userbotClientSingleton;
-  }
-  if (_userbotClientInitLock) return _userbotClientInitLock;
-  _userbotClientInitLock = (async () => {
-    const row = await UserbotAccount.findOne({ session: { $ne: null, $exists: true } })
-      .select('_id session api_id api_hash')
-      .sort({ updatedAt: -1 })
-      .limit(1)
-      .lean();
-    if (!row || !row.session) return null;
-    const apiId = Number(row.api_id || process.env.API_ID || 0) || null;
-    const apiHash = String(row.api_hash || process.env.API_HASH || '').trim() || null;
-    if (!apiId || !apiHash) {
-      console.warn('[userbot] saved session exists but API_ID/API_HASH not set — userbot direct fallback unavailable.');
-      return null;
-    }
-    let client = new TelegramClient(new StringSession(row.session), apiId, apiHash, {
-      useWSS: true,
-      autoReconnect: true,
-      timeout: 20000,
-      requestRetries: 1,
-      connectionRetries: 2,
-      retryDelay: 1000,
-    });
-    client.setLogLevel?.('none');
-    try { if (typeof client.on === 'function') {
-      client.on('error', (e) => {
-        const msg = String(e?.message || e || '').toLowerCase();
-        if (msg.includes('channels.getchannels') || msg.includes('channel_invalid') || msg.includes('flood')) return;
-        console.warn('[userbot client event err]:', String(e?.message || e || '').slice(0, 200));
-      });
-      client._oldCatchUnhandled = true;
-    } } catch (_) {}
-    try { await client.connect({ timeout: 30000 }); } catch (e) {
-      console.warn('[userbot] connect failed:', e.message);
-      try { await client.destroy?.()?.catch?.(() => {}); } catch (_) {}
-      return null;
-    }
-    try {
-      const me = await client.getMe({ timeout: 15000 }).catch(() => null);
-      if (!me) {
-        console.warn('[userbot] client connected but getMe failed — session likely stale.');
-        try { await client.destroy?.()?.catch?.(() => {}); } catch (_) {}
-        return null;
-      }
-    } catch (e) {
-      console.warn('[userbot] getMe failed:', e.message);
-      try { await client.destroy?.()?.catch?.(() => {}); } catch (_) {}
-      return null;
-    }
-    _userbotClientSingleton = client;
-    _userbotClientAccountId = String(row._id);
-    return client;
-  })();
-  try {
-    const c = await _userbotClientInitLock;
-    return c;
-  } finally {
-    _userbotClientInitLock = null;
-  }
-}
-
-function normalizeSourceChannelIdToUserbot(channelIdAny) {
-  if (channelIdAny == null || channelIdAny === '') return null;
-  const s = String(channelIdAny).trim();
-  const digits = s.replace(/^-100/, '').replace(/^-/, '').replace(/[^0-9]/g, '');
-  if (!digits) return null;
-  const asBigInt = BigInt(digits);
-  if (s.startsWith('-100') || BigInt.asIntN(64, asBigInt) < 0n) {
-    return Number('-100' + digits);
-  }
-  const asNum = Number(digits);
-  if (asNum < 0) return asNum;
-  return Number('-100' + digits);
-}
-
-async function getUserbotEntitySafe(userbotClient, channelIdAny, chatIdAny) {
-  if (!userbotClient || !channelIdAny) return null;
-  let tryList = [];
-  const neg = normalizeSourceChannelIdToUserbot(channelIdAny);
-  if (neg) tryList.push(neg);
-  if (String(channelIdAny).trim() !== String(neg ?? '')) tryList.push(String(channelIdAny).trim());
-  if (chatIdAny) {
-    const tchat = String(chatIdAny).trim();
-    if (!tryList.includes(tchat)) tryList.push(tchat);
-  }
-  let lastErr = null;
-  for (const candidate of tryList) {
-    for (const fn of [
-      (c) => userbotClient.getEntity(c),
-      (c) => userbotClient.getInputEntity(c),
-      (c) => userbotClient.getPeerId(c),
-    ]) {
-      try {
-        const out = await Promise.race([
-          Promise.resolve(fn(candidate)),
-          new Promise((_res, rej) => setTimeout(() => rej(new Error('getEntity_timeout')), 8000)),
-        ]);
-        if (out) return { entity: out, raw: candidate };
-      } catch (e) { lastErr = e; }
-    }
-  }
-  if (lastErr) console.warn('[userbot] getUserbotEntitySafe last error:', String(lastErr.message || lastErr).slice(0, 180), 'src=', channelIdAny);
-  return null;
-}
-
-const channelEntityLRU = new LRUCache({ max: 200, ttl: 5 * 60 * 1000 });
-
-async function resolveUserbotEntityOnce(userbotClient, channelIdAny) {
-  if (!userbotClient || !channelIdAny) return null;
-  const cacheKey = String(channelIdAny);
-  if (channelEntityLRU.has(cacheKey)) {
-    const v = channelEntityLRU.get(cacheKey);
-    return v || null;
-  }
-  const tryList = [];
-  const digOnly = String(cacheKey).replace(/[^0-9]/g, '');
-  if (digOnly) {
-    const abs = digOnly.startsWith('100') ? digOnly.slice(3) : digOnly;
-    const clean = Number(BigInt.asIntN(64, BigInt(abs)));
-    for (const prefix of ['-100', '-', '']) {
-      const v = Number(prefix + abs);
-      if (!Number.isNaN(v) && Number.isFinite(v)) tryList.push(v);
-    }
-    if (clean !== Number(abs)) tryList.push(clean);
-    tryList.push(Number(cacheKey));
-  } else {
-    tryList.push(cacheKey);
-  }
-  const uniq = [];
-  for (const c of tryList) {
-    if (!uniq.includes(String(c))) uniq.push(String(c));
-  }
-  let out = null;
-  for (const candidate of uniq) {
-    for (const fn of [
-      (c) => userbotClient.getEntity(c),
-      (c) => userbotClient.getInputEntity(c),
-    ]) {
-      try {
-        const got = await Promise.race([
-          Promise.resolve(fn(candidate)),
-          new Promise((_res, rej) => setTimeout(() => rej(new Error('entity_resolve_timeout')), 6000)),
-        ]);
-        if (got) { out = got; break; }
-      } catch (_e) { /* try next */ }
-    }
-    if (out) break;
-  }
-  if (out) {
-    channelEntityLRU.set(cacheKey, out);
-    return out;
-  } else {
-    channelEntityLRU.set(cacheKey, false);
-    return null;
-  }
-}
-
-async function uploadFileViaUserbot(userbotClient, row, chatId) {
-  if (!row || !row.source || !row.source.channel_id || !row.source.message_id) return null;
-  let fromEntity = null;
-  let toEntity = null;
-  try {
-    fromEntity = await resolveUserbotEntityOnce(userbotClient, row.source.channel_id);
-    if (!fromEntity) return null;
-  } catch (e) {
-    console.warn('[userbot] source resolve err:', String(e.message || e).slice(0, 180));
-    return null;
-  }
-  try {
-    toEntity = await resolveUserbotEntityOnce(userbotClient, chatId);
-    if (!toEntity) return null;
-  } catch (e) {
-    console.warn('[userbot] target resolve err:', String(e.message || e).slice(0, 180));
-    return null;
-  }
-  try {
-    const msgId = Number(row.source.message_id);
-    let fetchedMsg = null;
-    const fetchAttempts = [
-      async () => {
-        const m = await userbotClient.getMessages(fromEntity, { ids: [msgId], limit: 1 });
-        return m && m.length ? m[0] : null;
-      },
-      async () => {
-        const iter = await userbotClient.getHistory(fromEntity, { limit: 30 });
-        const arr = Array.isArray(iter) ? iter : (iter && Array.isArray(iter.messages) ? iter.messages : null);
-        if (!arr) return null;
-        return arr.find(m => Number(m.id) === msgId) || null;
-      },
-    ];
-    for (const fn of fetchAttempts) {
-      try {
-        const got = await fn();
-        if (got) { fetchedMsg = got; break; }
-      } catch (e) {}
-    }
-    if (!fetchedMsg) return null;
-    const media = fetchedMsg.media || null;
-    if (!media) return null;
-    const cap = fetchedMsg.message || '';
-    const sendAttempts = [
-      async () => {
-        const res = await userbotClient.invoke(new Api.messages.SendMedia({
-          peer: toEntity,
-          media: media,
-          message: cap,
-          randomId: Math.floor(Math.random() * 1e18),
-        }), { timeout: 60000 });
-        if (res && res.id) return { ok: true, via: 'userbot_sendMedia', messageId: Number(res.id) };
-        return null;
-      },
-      async () => {
-        const res = await userbotClient.sendFile(toEntity, {
-          file: media,
-          caption: cap,
-          workers: 1,
-          progressCallback: undefined,
-        });
-        if (res && res.id) return { ok: true, via: 'userbot_sendFile', messageId: Number(res.id) };
-        return null;
-      },
-    ];
-    for (const fn of sendAttempts) {
-      try {
-        const r = await fn();
-        if (r && r.ok) return r;
-      } catch (_e) {}
-    }
-    return null;
-  } catch (e) {
-    console.warn('[userbot] uploadFileViaUserbot top-level err:', String(e?.message || e || '').slice(0, 200));
-    return null;
-  }
-}
-
-function isTimeoutError(err) {
-  if (!err) return false;
-  const name = err?.name || '';
-  const msg  = String(err?.message || err?.description || '').toLowerCase();
-  if (name === 'TimeoutError') return true;
-  if (msg.includes('promise timed out after')) return true;
-  if (msg.includes('timeout')) return true;
-  return false;
-}
-
-async function withRetry(fn, maxRetries = 4, hardDeadlineMs = 60_000) {
-  const startedAt = Date.now();
+async function withRetry(fn, maxRetries = 5) {
   let retries = 0;
   while (retries < maxRetries) {
-    const deadlineExceeded = hardDeadlineMs > 0 && (Date.now() - startedAt) >= hardDeadlineMs;
-    if (deadlineExceeded) throw new Error(`[withRetry] deadline ${hardDeadlineMs}ms exceeded (retries=${retries})`);
     try {
       return await fn();
     } catch (err) {
-      if (err && err.response && err.response.error_code === 429 && err.response.parameters && err.response.parameters.retry_after) {
-        const retryAfter = Math.min(60_000, err.response.parameters.retry_after * 1000);
-        if ((Date.now() - startedAt) + retryAfter > hardDeadlineMs && hardDeadlineMs > 0) {
-          throw new Error(`[withRetry] 429 retry_after=${retryAfter} would exceed deadline; retries=${retries}; err=${String(err?.response?.description || err.message).slice(0, 120)}`);
-        }
+      if (err.response && err.response.error_code === 429 && err.response.parameters && err.response.parameters.retry_after) {
+        const retryAfter = err.response.parameters.retry_after * 1000;
+        console.log(`[withRetry] Got 429, waiting ${retryAfter}ms...`);
         await sleep(retryAfter);
         retries++;
-        continue;
+      } else {
+        throw err;
       }
-      if (isTimeoutError(err)) {
-        const backoff = Math.min(8000, 1500 * Math.pow(2, retries));
-        if ((Date.now() - startedAt) + backoff > hardDeadlineMs && hardDeadlineMs > 0) {
-          throw new Error(`[withRetry] timeout retry backoff=${backoff} would exceed deadline; retries=${retries}; err=${String(err.message).slice(0, 120)}`);
-        }
-        await sleep(backoff);
-        retries++;
-        continue;
-      }
-      throw err;
     }
   }
   throw new Error(`Max retries (${maxRetries}) exceeded`);
@@ -337,27 +69,15 @@ function summarizeErr(err) {
 
 async function hasActiveUserbot() {
   try {
-    const c = await getUserbotClient();
-    return !!c;
+    const row = await UserbotAccount.findOne({ session: { $ne: null, $exists: true } })
+      .select('_id')
+      .limit(1)
+      .lean();
+    return !!row;
   } catch (err) {
     console.error('[delivery] hasActiveUserbot error:', err.message);
     return false;
   }
-}
-
-const HOT_SEND_HARD_TIMEOUT_MS = 45_000;
-const COLD_COPY_HARD_TIMEOUT_MS = 60_000;
-
-function withHardTimeout(promiseMs, label, timeoutMs) {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      reject(new Error(`[delivery] ${label || 'task'} hard timeout after ${timeoutMs}ms`));
-    }, timeoutMs);
-    Promise.resolve(promiseMs).then(
-      (v) => { clearTimeout(timer); resolve(v); },
-      (e) => { clearTimeout(timer); reject(e); }
-    );
-  });
 }
 
 async function hotSendMedia(telegram, chatId, row, replyToMessageId) {
@@ -370,41 +90,23 @@ async function hotSendMedia(telegram, chatId, row, replyToMessageId) {
     const baseExtra = {};
     if (replyToMessageId) baseExtra.reply_to_message_id = replyToMessageId;
 
-    await withHardTimeout((async () => {
-      unwrapQueueResult(await enqueueDeliver(async () => {
-        await withRetry(async () => {
-          if (kind === 'photo') {
-            await telegram.sendPhoto(chatId, fid, baseExtra);
-          } else if (kind === 'document') {
-            const extra = { disable_content_type_detection: false, ...baseExtra };
-            await telegram.sendDocument(chatId, fid, extra);
-          } else {
-            const extra = { supports_streaming: true, ...baseExtra };
-            await telegram.sendVideo(chatId, fid, extra);
-          }
-        }, 4, HOT_SEND_HARD_TIMEOUT_MS);
-      }));
-    })(), `hot_send_${kind}_${chatId}`, HOT_SEND_HARD_TIMEOUT_MS + 5000);
-
+    unwrapQueueResult(await enqueueDeliver(async () => {
+      await withRetry(async () => {
+        if (kind === 'photo') {
+          await telegram.sendPhoto(chatId, fid, baseExtra);
+        } else if (kind === 'document') {
+          const extra = { disable_content_type_detection: false, ...baseExtra };
+          await telegram.sendDocument(chatId, fid, extra);
+        } else {
+          const extra = { supports_streaming: true, ...baseExtra };
+          await telegram.sendVideo(chatId, fid, extra);
+        }
+      });
+    }));
     return { ok: true, via: `hot_send_${kind}` };
   } catch (err) {
-    if (isTimeoutError(err) || (String(err.message || '').startsWith('[delivery] hot_send_') && err.message.includes('hard timeout'))) {
-      return { ok: false, reason: 'hot_send_timeout', error: err, hardFail: false };
-    }
     if (isSkippableTelegramError(err)) {
       return { ok: false, reason: 'chat_skippable', error: err, skippable: true };
-    }
-    if (isBadFileIdentifierError(err)) {
-      try {
-        if (row && row._id) {
-          await Media.updateOne(
-            { _id: row._id },
-            { $unset: { [`bot_file_ids.${BOT_KEY}`]: 1 } }
-          ).catch(() => {});
-          deliveryCache.delete(String(row._id));
-        }
-      } catch (_) {}
-      return { ok: false, reason: 'hot_send_failed_stale_slot', error: err, hardFail: false };
     }
     return { ok: false, reason: 'hot_send_failed', error: err };
   }
@@ -451,50 +153,13 @@ function extractFileIdFromSentMessage(msg) {
   return null;
 }
 
-const siblingByCaptureLRU = new LRUCache({ max: 2000, ttl: 10 * 60 * 1000 });
-async function findAccessibleSiblingMedia(row, fileManagerChannelId) {
-  if (!row || !fileManagerChannelId) return null;
-  const ck = String(row.capture_key || '');
-  const srcCh = String(row.source?.channel_id || '');
-  const fmc = String(fileManagerChannelId);
-  if (ck && srcCh !== fmc) {
-    const cacheKey = `sib:${ck}`;
-    const cached = siblingByCaptureLRU.peek(cacheKey);
-    if (cached !== undefined) return cached || null;
-    const queries = [{ capture_key: ck, 'source.channel_id': fmc, 'source.message_id': { $exists: true, $ne: null } }];
-    if (row.file_unique_id) queries.unshift({ file_unique_id: row.file_unique_id, 'source.channel_id': fmc, 'source.message_id': { $exists: true, $ne: null } });
-    let sib = null;
-    for (const q of queries) {
-      try {
-        sib = await Media.findOne(q).select('_id source capture_key bot_file_ids metadata file_unique_id').lean();
-        if (sib && sib.source && sib.source.channel_id && sib.source.message_id != null) break;
-      } catch (_e) { sib = null; }
-    }
-    if (sib && sib.source && sib.source.channel_id && sib.source.message_id != null) {
-      siblingByCaptureLRU.set(cacheKey, sib);
-      return sib;
-    } else {
-      siblingByCaptureLRU.set(cacheKey, false);
-    }
-  }
-  return null;
-}
-
 async function coldForwardAndSeed(telegram, chatId, row, replyToMessageId, fileManagerChannelId) {
   try {
     if (!row || !row.source || !row.source.channel_id || !row.source.message_id) {
       return { ok: false, reason: 'missing_source' };
     }
-    let actualRow = row;
-    let siblingMode = false;
     if (fileManagerChannelId != null && String(row.source.channel_id) !== String(fileManagerChannelId)) {
-      const sibling = await findAccessibleSiblingMedia(row, fileManagerChannelId);
-      if (sibling && sibling.source && sibling.source.channel_id && sibling.source.message_id) {
-        actualRow = sibling;
-        siblingMode = true;
-      } else {
-        return { ok: false, reason: 'channel_unapproved' };
-      }
+      return { ok: false, reason: 'channel_unapproved' };
     }
     const extra = replyToMessageId
       ? { reply_to_message_id: replyToMessageId, disable_notification: true }
@@ -503,35 +168,25 @@ async function coldForwardAndSeed(telegram, chatId, row, replyToMessageId, fileM
     let lastError = null;
     let msg = null;
     try {
-      await withHardTimeout((async () => {
-        unwrapQueueResult(await enqueueDeliver(async () => {
-          await withRetry(async () => {
-            msg = await telegram.copyMessage(chatId, actualRow.source.channel_id, actualRow.source.message_id, extra);
-          }, 3, COLD_COPY_HARD_TIMEOUT_MS);
-        }));
-      })(), `cold_copy_${actualRow.source.channel_id}_${actualRow.source.message_id}_${chatId}`, COLD_COPY_HARD_TIMEOUT_MS + 8000);
+      unwrapQueueResult(await enqueueDeliver(async () => {
+        await withRetry(async () => {
+          msg = await telegram.copyMessage(chatId, row.source.channel_id, row.source.message_id, extra);
+        });
+      }));
     } catch (forwardErr) {
       lastError = forwardErr;
       if (isSkippableTelegramError(forwardErr)) {
         return { ok: false, reason: 'chat_skippable', error: forwardErr, skippable: true };
       }
-      if (isTimeoutError(forwardErr) || (String(forwardErr.message || '').startsWith('[delivery] cold_copy_') && forwardErr.message.includes('hard timeout'))) {
-        return { ok: false, reason: 'cold_copy_timeout', error: forwardErr, hardFail: false };
-      }
       try {
-        await withHardTimeout((async () => {
-          unwrapQueueResult(await enqueueDeliver(async () => {
-            await withRetry(async () => {
-              msg = await telegram.forwardMessage(chatId, row.source.channel_id, row.source.message_id, extra);
-            }, 3, COLD_COPY_HARD_TIMEOUT_MS);
-          }));
-        })(), `cold_forward_${row.source.channel_id}_${row.source.message_id}_${chatId}`, COLD_COPY_HARD_TIMEOUT_MS + 8000);
+        unwrapQueueResult(await enqueueDeliver(async () => {
+          await withRetry(async () => {
+            msg = await telegram.forwardMessage(chatId, row.source.channel_id, row.source.message_id, extra);
+          });
+        }));
       } catch (err) {
         lastError = err;
         msg = null;
-        if (isTimeoutError(err) || (String(err.message || '').startsWith('[delivery] cold_forward_') && err.message.includes('hard timeout'))) {
-          return { ok: false, reason: 'cold_forward_timeout', error: err, hardFail: false };
-        }
       }
     }
 
@@ -562,9 +217,6 @@ async function coldForwardAndSeed(telegram, chatId, row, replyToMessageId, fileM
 
     return { ok: true, via: 'cold_copy_forward', delivered: !!msg };
   } catch (err) {
-    if (isTimeoutError(err) || (String(err.message || '').startsWith('[delivery] cold_') && err.message.includes('hard timeout'))) {
-      return { ok: false, reason: 'cold_timeout', error: err, hardFail: false };
-    }
     if (isSkippableTelegramError(err)) {
       return { ok: false, reason: 'chat_skippable', error: err, skippable: true };
     }
@@ -573,265 +225,94 @@ async function coldForwardAndSeed(telegram, chatId, row, replyToMessageId, fileM
   }
 }
 
-async function userbotDirectFallback(row, chatId, userbotClient) {
-  const client = userbotClient || (await getUserbotClient().catch(() => null));
-  if (!client) {
-    return { ok: false, reason: 'no_userbot_client' };
-  }
+async function userbotDirectFallback(row, chatId) {
   try {
-    const startedAt = Date.now();
-    const res = await uploadFileViaUserbot(client, row, chatId);
-    if (res && res.ok) {
-      return { ok: true, via: res.via || 'userbot', messageId: res.messageId, elapsedMs: Date.now() - startedAt };
+    const ok = await hasActiveUserbot();
+    if (!ok) {
+      console.warn('[delivery] userbot fallback skipped: no userbot session in DB (plan 4/5 silent).');
+      return { ok: false, reason: 'no_userbot_session' };
     }
-    return { ok: false, reason: 'userbot_send_failed', hardFail: false };
+    return { ok: false, reason: 'userbot_engine_stub' };
   } catch (err) {
     console.error('[delivery] userbotDirectFallback error:', err.message);
-    return { ok: false, reason: 'userbot_error', error: err, hardFail: false };
+    return { ok: false, reason: 'userbot_error', error: err };
   }
 }
 
-async function deliverMedia(telegram, chatId, count, { excludeIds = [], onProgress } = {}) {
-  const countNum = Number(count) || 0;
-  const TARGET = Math.max(1, Math.floor(countNum));
+async function deliverMedia(telegram, chatId, count, { excludeIds = [] } = {}) {
   const delivered = [];
-  const usedIds = new Set(excludeIds.map((id) => String(id)));
+  const usedIds = new Set(excludeIds.map((id) => id.toString()));
   let shouldAbortChat = false;
-  let hardFailStreak = 0;
-  let hardFailTotal = 0;
-  const HARD_FAIL_ABORT_STREAK = 16;
-  const HARD_FAIL_ABORT_TOTAL = 80;
-  const PARALLEL_BATCH_SIZE = Number(process.env.DELIVERY_PARALLEL) || 12;
-  const SAMPLING_MAX_MULT = 30;
-  const SAMPLING_MIN = 120;
-  const onProgressFn = typeof onProgress === 'function' ? onProgress : null;
-  const startedAt = Date.now();
-  let tierCounts = { hot: 0, userbot: 0, cold: 0 };
-  let tierElapsed = { hot: 0, userbot: 0, cold: 0 };
 
   let fileManagerChannelId = null;
-  try { fileManagerChannelId = await Settings.get('fileManagerChannel'); } catch (_e) {}
+  try {
+    fileManagerChannelId = await Settings.get('fileManagerChannel');
+  } catch (_e) { /* ignore */ }
 
-  const userbotClient = await getUserbotClient().catch(() => null);
-  const userbotAvailable = !!userbotClient;
+  while (delivered.length < count && !shouldAbortChat) {
+    const filter = { _id: { $nin: Array.from(usedIds) } };
+    const available = await Media.countDocuments(filter);
 
-  async function resolveBestRowForDelivery(candidateMediaRow) {
-    if (!candidateMediaRow || !fileManagerChannelId) return candidateMediaRow;
-    const srcCh = String(candidateMediaRow.source?.channel_id || '');
-    if (srcCh === String(fileManagerChannelId)) return candidateMediaRow;
-    const hasFmc = candidateMediaRow.bot_file_ids && candidateMediaRow.bot_file_ids[BOT_KEY];
-    if (hasFmc) return candidateMediaRow;
-    try {
-      const sib = await findAccessibleSiblingMedia(candidateMediaRow, fileManagerChannelId);
-      if (sib && sib.source && sib.source.channel_id && sib.source.message_id != null) {
-        candidateMediaRow = Object.assign({}, candidateMediaRow, {
-          source: Object.assign({}, sib.source),
-          bot_file_ids: Object.assign({}, candidateMediaRow.bot_file_ids || {}, (sib.bot_file_ids || {})),
-          metadata: Object.assign({}, candidateMediaRow.metadata || {}, (sib.metadata || {})),
-          _deliverySiblingOf: candidateMediaRow._id,
-        });
-      }
-    } catch (_e) {}
-    return candidateMediaRow;
-  }
+    if (available === 0) break;
 
-  function emitProgress(eventName, payload) {
-    if (!onProgressFn) return;
-    try { onProgressFn(eventName, { ...(payload || {}), target: TARGET, delivered: delivered.length, elapsedMs: Date.now() - startedAt, tierCounts, tierElapsed }); } catch (_e) {}
-  }
+    const needed = count - delivered.length;
+    const sampleSize = Math.min(Math.max(needed * 40, needed + 80), available);
+    const pipeline = [
+      { $match: filter },
+      { $sample: { size: sampleSize } },
+    ];
+    const candidates = await Media.aggregate(pipeline);
 
-  emitProgress('begin');
+    if (!candidates.length) break;
 
-  async function deliverOne(item, stopToken) {
-    const itemId = item._id.toString();
-    if (usedIds.has(itemId)) return { consumed: false, ok: false };
-    usedIds.add(itemId);
+    for (const item of candidates) {
+      const itemId = item._id.toString();
+      if (usedIds.has(itemId)) continue;
 
-    const t0 = Date.now();
-    let sentOk = false;
-    let skippableHit = false;
-    let hardFailHit = false;
-    let via = null;
+      let sentOk = false;
+      let skippableHit = false;
 
-    let lastHot = null;
-    {
-      const th = Date.now();
-      const resHot = await hotSendMedia(telegram, chatId, item);
-      lastHot = resHot;
-      if (resHot && resHot.ok) {
-        sentOk = true; via = 'hot';
-        tierCounts.hot += 1; tierElapsed.hot += Date.now() - th;
-      } else if (resHot && resHot.skippable) {
+      let res = await hotSendMedia(telegram, chatId, item);
+      if (res && res.ok) {
+        sentOk = true;
+      } else if (res && res.skippable) {
         skippableHit = true;
-      } else if (resHot && resHot.hardFail === false) {
-        hardFailHit = true;
       }
-    }
 
-    if (!sentOk && !skippableHit && userbotAvailable) {
-      const tub = Date.now();
-      const resUb = await userbotDirectFallback(item, chatId, userbotClient);
-      if (resUb && resUb.ok) {
-        sentOk = true; via = 'userbot'; hardFailHit = false;
-        tierCounts.userbot += 1; tierElapsed.userbot += Date.now() - tub;
-      } else if (resUb && resUb.skippable) {
-        skippableHit = true; hardFailHit = false;
-      } else if (resUb && resUb.hardFail === false) {
-        // Only upgrade to hardFail when hot also explicitly said hardFail (or was unknown fallback)
-        if (!hardFailHit && lastHot && lastHot.hardFail === false) hardFailHit = true;
-      } else {
-        // userbot failed but not a clear error (e.g. entity resolve, session stale): NOT a hardFail, don't count streak.
-        if (hardFailHit && lastHot && lastHot.hardFail !== false) hardFailHit = false;
-      }
-    }
-
-    if (!sentOk && !skippableHit) {
-      const sourceOk = item && item.source &&
-        item.source.channel_id && item.source.message_id != null && item.source.channel_id !== '';
-      if (sourceOk) {
-        const tc = Date.now();
-        const resCold = await coldForwardAndSeed(telegram, chatId, item, null, fileManagerChannelId);
-        if (resCold && resCold.ok) {
-          sentOk = true; via = 'cold'; hardFailHit = false;
-          tierCounts.cold += 1; tierElapsed.cold += Date.now() - tc;
-        } else if (resCold && resCold.skippable) {
-          skippableHit = true; hardFailHit = false;
-        } else if (resCold && resCold.hardFail === false) {
-          if (!hardFailHit && lastHot && lastHot.hardFail === false) hardFailHit = true;
-        } else {
-          // cold silently failed (not a "hardFail=false" response): do NOT force a streak bump if we only had one tier failing silently
-          // unless hot also explicitly hardFailed
-          if (!lastHot || lastHot.hardFail !== false) hardFailHit = false;
+      if (!sentOk && !skippableHit) {
+        res = await coldForwardAndSeed(telegram, chatId, item, null, fileManagerChannelId);
+        if (res && res.ok) {
+          sentOk = true;
+        } else if (res && res.skippable) {
+          skippableHit = true;
         }
-      } else {
-        // No source at all: if userbot wasn't available and hot returned !ok non-skippable → consider it a soft miss, not hardFail
-        hardFailHit = false;
       }
-    }
 
-    if (skippableHit) {
-      shouldAbortChat = true;
-      return { consumed: true, ok: false, skippable: true };
-    }
-    if (sentOk) {
-      hardFailStreak = 0;
-      delivered.push(item);
-      try {
-        Media.updateOne({ _id: item._id }, { $set: { last_seen_at: new Date() } }).catch(() => {});
-      } catch (_) {}
-      emitProgress('batch', { itemId, via });
-      return { consumed: true, ok: true, via };
-    } else {
-      if (hardFailHit) {
-        hardFailStreak += 1;
-        hardFailTotal += 1;
+      if (!sentOk && !skippableHit) {
+        res = await userbotDirectFallback(item, chatId);
+        if (res && res.ok) {
+          sentOk = true;
+        }
       }
-      return { consumed: true, ok: false, hardFailHit };
-    }
-  }
 
-  const passes = [];
-  const hotKeyPath = `bot_file_ids.${BOT_KEY}`;
-  passes.push({
-    name: 'hot-only',
-    description: 'FAST PATH - only rows already uploaded by THIS bot (HOT slot, instant Bot API send, 0 userbot)',
-    filterExtra: { [hotKeyPath]: { $exists: true, $ne: null } },
-  });
-  if (fileManagerChannelId != null) {
-    passes.push({
-      name: 'own-channel-only',
-      description: 'MEDIUM PATH - rows from our fileManagerChannel (guaranteed copyMessage accessible; userbot if no hot slot)',
-      filterExtra: { 'source.channel_id': String(fileManagerChannelId) },
-    });
-    passes.push({
-      name: 'accessible-first',
-      description: 'FAST+MEDIUM combined (hot slot OR own channel source)',
-      filterExtra: {
-        $or: [
-          { 'source.channel_id': String(fileManagerChannelId) },
-          { [hotKeyPath]: { $exists: true, $ne: null } },
-        ],
-      },
-    });
-  }
-  passes.push({ name: 'fallback-full-pool', description: 'SLOW PATH - full pool with sibling lookup + userbot tier', filterExtra: {} });
-
-  for (const pass of passes) {
-    if (delivered.length >= TARGET || shouldAbortChat) break;
-    while (delivered.length < TARGET && !shouldAbortChat) {
-      const filterBase = { _id: { $nin: Array.from(usedIds) } };
-      const filter = pass.filterExtra && Object.keys(pass.filterExtra).length ? { $and: [filterBase, pass.filterExtra] } : filterBase;
-      const available = await Media.countDocuments(filter);
-      if (available === 0) break;
-      if (hardFailStreak >= HARD_FAIL_ABORT_STREAK) {
-        console.error(`[delivery] bail after ${hardFailStreak} consecutive hard-fails streak; total fails=${hardFailTotal}; returning ${delivered.length}/${TARGET} chat=${chatId} pass=${pass.name}`);
+      if (skippableHit) {
+        usedIds.add(itemId);
+        shouldAbortChat = true;
         break;
       }
-      if (hardFailTotal >= HARD_FAIL_ABORT_TOTAL) {
-        console.error(`[delivery] bail after ${hardFailTotal} cumulative hard-fails; returning ${delivered.length}/${TARGET} chat=${chatId} pass=${pass.name}`);
-        break;
-      }
-      const remaining = TARGET - delivered.length;
-      const sampleSize = Math.min(Math.max(remaining * SAMPLING_MAX_MULT, remaining + SAMPLING_MIN), available);
-      const candidates = await Media.aggregate([{ $match: filter }, { $sample: { size: sampleSize } }]);
-      if (!candidates.length) break;
-      // #region debug-point H2:sample-candidates
-      (()=>{const fs=require('fs'),p='.dbg/gift-progress-stuck.env';let u='http://127.0.0.1:7777/event',s='gift-progress-stuck';try{const e=fs.readFileSync(p,'utf8');u=e.match(/DEBUG_SERVER_URL=(.+)/)?.[1]||u;s=e.match(/DEBUG_SESSION_ID=(.+)/)?.[1]||s}catch{}const fmcS=String(fileManagerChannelId||'');const ownCh=candidates.filter(c=>String(c.source?.channel_id||'')===fmcS).length;const hotS=candidates.filter(c=>!!(c.bot_file_ids&&c.bot_file_ids[BOT_KEY])).length;const foreign=candidates.length-ownCh;const siblingCandidates=candidates.filter(c=>String(c.source?.channel_id||'')!==fmcS).map(c=>String(c.capture_key||''));fetch(u,{method:'POST',body:JSON.stringify({sessionId:s,runId:'post2',hypothesisId:'H2',location:'mediaService.js:deliverMedia-sample',msg:'[DEBUG] deliverMedia sample round',data:{pass:pass.name,TARGET,deliveredNow:delivered.length,sampleSize,candidates:candidates.length,ownChannelRows:ownCh,hotSlotRows:hotS,foreignRows:foreign,uniqueForeignCKs:new Set(siblingCandidates.filter(Boolean)).size,usedIdsSize:usedIds.size,available,hardFailStreak,hardFailTotal},ts:Date.now()})}).catch(()=>{})})();
-      // #endregion
-      let cursor = 0;
-      let quitOuter = false;
-      while (cursor < candidates.length && delivered.length < TARGET && !quitOuter && !shouldAbortChat) {
-        const batch = candidates.slice(cursor, cursor + PARALLEL_BATCH_SIZE);
-        cursor += batch.length;
-        const batchIds = batch.map(x => String(x._id));
-        // #region debug-point H4:batch-start
-        (()=>{const fs=require('fs'),p='.dbg/gift-progress-stuck.env';let u='http://127.0.0.1:7777/event',s='gift-progress-stuck';try{const e=fs.readFileSync(p,'utf8');u=e.match(/DEBUG_SERVER_URL=(.+)/)?.[1]||u;s=e.match(/DEBUG_SESSION_ID=(.+)/)?.[1]||s}catch{}fetch(u,{method:'POST',body:JSON.stringify({sessionId:s,runId:'post2',hypothesisId:'H4',location:'mediaService.js:deliverMedia-batch-start',msg:'[DEBUG] batch processing start',data:{pass:pass.name,batchSize:batch.length,batchIds:batchIds.map(i=>i.slice(0,8)),deliveredNow:delivered.length,cursor,candidatesLen:candidates.length,TARGET,PARALLEL_BATCH_SIZE},ts:Date.now()})}).catch(()=>{})})();
-        // #endregion
-        const resolved = await Promise.all(batch.map(it => resolveBestRowForDelivery(it)));
-        const fmcS = String(fileManagerChannelId || '');
-        const prune = [];
-        const toDeliver = [];
-        for (let i = 0; i < resolved.length; i++) {
-          const r = resolved[i];
-          const isOwn = String(r.source?.channel_id || '') === fmcS;
-          const hasHot = !!(r.bot_file_ids && r.bot_file_ids[BOT_KEY]);
-          if (pass.name === 'hot-only' && !hasHot) { prune.push(r); continue; }
-          if (pass.name === 'own-channel-only' && !isOwn && !hasHot) { prune.push(r); continue; }
-          if (!isOwn && !hasHot && (pass.name !== 'fallback-full-pool')) { prune.push(r); continue; }
-          toDeliver.push(r);
-        }
-        if (prune.length) {
-          for (const p of prune) if (p && p._id != null) usedIds.add(String(p._id));
-        }
-        // #region debug-point H4:batch-resolved
-        (()=>{const fs=require('fs'),p='.dbg/gift-progress-stuck.env';let u='http://127.0.0.1:7777/event',s='gift-progress-stuck';try{const e=fs.readFileSync(p,'utf8');u=e.match(/DEBUG_SERVER_URL=(.+)/)?.[1]||u;s=e.match(/DEBUG_SESSION_ID=(.+)/)?.[1]||s}catch{}const afterOwnCh=toDeliver.filter(r=>String(r.source?.channel_id||'')===fmcS).length;const afterHot=toDeliver.filter(r=>!!(r.bot_file_ids&&r.bot_file_ids[BOT_KEY])).length;const sibCount=resolved.filter(r=>!!r._deliverySiblingOf).length;fetch(u,{method:'POST',body:JSON.stringify({sessionId:s,runId:'post2',hypothesisId:'H4',location:'mediaService.js:deliverMedia-batch-resolved',msg:'[DEBUG] batch resolveBestRowForDelivery done + prune',data:{pass:pass.name,batchSize:resolved.length,toDeliverSize:toDeliver.length,prunedSize:prune.length,siblingMapped:sibCount,afterOwnChannelRows:afterOwnCh,afterHotSlotRows:afterHot},ts:Date.now()})}).catch(()=>{})})();
-        // #endregion
-        let results = [];
-        if (toDeliver.length) results = await Promise.all(toDeliver.map(it => deliverOne(it)));
-        // #region debug-point H4:batch-done
-        (()=>{const fs=require('fs'),p='.dbg/gift-progress-stuck.env';let u='http://127.0.0.1:7777/event',s='gift-progress-stuck';try{const e=fs.readFileSync(p,'utf8');u=e.match(/DEBUG_SERVER_URL=(.+)/)?.[1]||u;s=e.match(/DEBUG_SESSION_ID=(.+)/)?.[1]||s}catch{}const oks=results.filter(r=>r.ok).length;const skips=results.filter(r=>r.skippable).length;const fails=results.length-oks-skips;fetch(u,{method:'POST',body:JSON.stringify({sessionId:s,runId:'post2',hypothesisId:'H4',location:'mediaService.js:deliverMedia-batch-done',msg:'[DEBUG] batch deliverOne done',data:{pass:pass.name,batchSize:toDeliver.length,okRows:oks,skippable:skips,fails,deliveredAfter:delivered.length,prunedFromBatch:prune.length},ts:Date.now()})}).catch(()=>{})})();
-        // #endregion
-        for (const r of results) {
-          if (r.skippable) { quitOuter = true; }
-        }
-        if (hardFailStreak >= HARD_FAIL_ABORT_STREAK || hardFailTotal >= HARD_FAIL_ABORT_TOTAL) {
-          quitOuter = true;
-        }
+
+      if (sentOk) {
+        delivered.push(item);
+        usedIds.add(itemId);
+        if (delivered.length === count) break;
+      } else {
+        usedIds.add(itemId);
+        continue;
       }
     }
   }
 
-  const finalSlice = delivered.slice(0, TARGET);
-  const totalElapsed = Date.now() - startedAt;
-  emitProgress('end', { finalCount: finalSlice.length });
-  console.log(
-    `[delivery] summary chat=${chatId} target=${TARGET} delivered=${finalSlice.length} ` +
-    `elapsed=${totalElapsed}ms ` +
-    `tier(hot=${tierCounts.hot},ub=${tierCounts.userbot},cold=${tierCounts.cold}) ` +
-    `elapsed(hot=${tierElapsed.hot}ms,ub=${tierElapsed.userbot}ms,cold=${tierElapsed.cold}ms) ` +
-    `streak=${hardFailStreak} fails=${hardFailTotal} abortChat=${shouldAbortChat ? 1 : 0} ubAvail=${userbotAvailable ? 1 : 0}`
-  );
-  return finalSlice;
+  return delivered;
 }
 
 module.exports = { deliverMedia, withRetry, BOT_KEY, hotSendMedia, coldForwardAndSeed, userbotDirectFallback, hasActiveUserbot };

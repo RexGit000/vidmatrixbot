@@ -9,9 +9,8 @@ const Settings = require('../models/Settings');
  * Pass `telegram` to resolve the channel name; omit it to show the raw ID only.
  */
 async function buildAdminStats(telegram) {
-  const [channelId, updatesChannelUsername, mediaCount, pkgCount, userCount, adminCount] = await Promise.all([
+  const [channelId, mediaCount, pkgCount, userCount, adminCount] = await Promise.all([
     Settings.get('fileManagerChannel'),
-    Settings.get('updatesChannelUsername'),
     Media.countDocuments(),
     Package.countDocuments({ isActive: true }),
     User.countDocuments(),
@@ -39,17 +38,9 @@ async function buildAdminStats(telegram) {
     channelLine = `📺 File channel: ${label} ✅`;
   }
 
-  const safeUpdatesUsername = updatesChannelUsername
-    ? String(updatesChannelUsername).replace(/([_*`\[])/g, '\\$1')
-    : null;
-  const updatesLine = safeUpdatesUsername
-    ? `📢 Updates channel: ${safeUpdatesUsername} ✅`
-    : '📢 Updates channel: _not set_';
-
   return (
     `📊 *Dashboard*\n\n` +
     `${channelLine}\n` +
-    `${updatesLine}\n` +
     `🎬 Media in bot: *${mediaCount}*\n` +
     `📦 Active packages: *${pkgCount}*\n` +
     `👥 Total users: *${userCount}*\n` +
