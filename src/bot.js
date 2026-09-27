@@ -10,7 +10,10 @@ const adminHandlers  = require('./handlers/admin');
 const paymentHandlers = require('./handlers/payment');
 const channelHandlers = require('./handlers/channel');
 
-const bot = new Telegraf(process.env.BOT_TOKEN);
+const HANDLER_TIMEOUT_MS = Number(process.env.HANDLER_TIMEOUT_MS) || 20 * 60 * 1000;
+const bot = new Telegraf(process.env.BOT_TOKEN, {
+  handlerTimeout: HANDLER_TIMEOUT_MS,
+});
 
 // ── Middleware ────────────────────────────────────────────────────────────────
 

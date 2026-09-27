@@ -150,65 +150,34 @@ async function deliverWithVerification({
   botUsername,
 }) {
   const promised = Number(finalMediaCount) || 0;
-  let cumulativeReturned = 0;
-  let cumulativeDeliveredIds = [];
-  let cumulativeSeenIds  = new Set();
 
-  function combineExcludeIds() {
-    const base = Array.isArray(userRecord?.receivedMedia) ? userRecord.receivedMedia.slice() : [];
-    const set = new Set(base.map((id) => id.toString()));
-    for (const id of cumulativeSeenIds) set.add(id.toString());
-    return Array.from(set);
-  }
-
-  function addToCumulative(items) {
-    if (!Array.isArray(items) || !items.length) return 0;
-    let newlyReturned = 0;
-    for (const it of items) {
-      if (it && it._id != null) {
-        const k = it._id.toString();
-        cumulativeSeenIds.add(k);
-        const alreadyDelivered = cumulativeDeliveredIds.includes(k) ||
-          (Array.isArray(userRecord?.receivedMedia) && userRecord.receivedMedia.some((id) => String(id) === k));
-        if (!alreadyDelivered) {
-          cumulativeDeliveredIds.push(k);
-          cumulativeReturned += 1;
-          newlyReturned += 1;
-        }
-      }
+  let rememberList = [];
+  function rememberInline(batchItems) {
+    if (!Array.isArray(batchItems) || !batchItems.length) return false;
+    let changed = false;
+    for (const it of batchItems) {
+      if (!it || it._id == null) continue;
+      const k = String(it._id);
+      if (rememberList.includes(k)) continue;
+      rememberList.push(k);
+      changed = true;
     }
-    return newlyReturned;
-  }
-
-  function addObservedUnique(observed) {
-    if (!observed) return 0;
-    let added = 0;
-    for (const id of observed) {
-      const k = String(id);
-      if (!cumulativeSeenIds.has(k)) {
-        cumulativeSeenIds.add(k);
-        added += 1;
-      }
-    }
-    return added;
+    return changed;
   }
 
   let lastReturnedCount = 0;
-  let lastObservedCount = 0;
   let actualCount = 0;
   let attempts = 0;
 
   while (attempts < MAX_TOTAL_DELIVERY_ATTEMPTS && actualCount < promised) {
     attempts += 1;
     const needed = Math.max(0, promised - actualCount);
-    const beforeSeenSize = cumulativeSeenIds.size;
-    armMediaSendObserver(telegram, chatId);
     let items = [];
     try {
       items = await Promise.race([
         (async () => {
-          const v = await deliverMediaFn(telegram, Number(userId), needed, {
-            excludeIds: combineExcludeIds(),
+          const v = await deliverMediaFn(telegram, Number(chatId) ?? Number(userId), needed, {
+            excludeIds: Array.isArray(userRecord?.receivedMedia) ? userRecord.receivedMedia.slice().concat(rememberList) : rememberList.slice(),
           });
           return Array.isArray(v) ? v : [];
         })(),
@@ -218,46 +187,42 @@ async function deliverWithVerification({
       ]);
     } catch (deliveryErr) {
       console.error('[deliverWithVerification] deliverMediaFn threw/stalled:', deliveryErr.message);
-      const obs = disarmAndCountMediaSendObserver(chatId);
       lastReturnedCount = 0;
-      lastObservedCount = (obs && obs.total) || 0;
-      const newObserved = addObservedUnique(obs ? (obs.messageIds || []) : []);
-      actualCount += Math.max(0, newObserved);
-      if (lastReturnedCount === 0 && lastObservedCount === 0) break;
-      continue;
+      break;
     }
-    const newlyReturned = addToCumulative(items);
-    lastReturnedCount = newlyReturned;
+    const returnedThisRound = Array.isArray(items) ? items.length : 0;
+    lastReturnedCount = returnedThisRound;
+    actualCount += returnedThisRound;
+    const anyChanged = rememberInline(items);
     if (typeof onNewBatchDelivered === 'function') {
       try { await Promise.resolve(onNewBatchDelivered(items)); } catch (_e) { /* swallow */ }
     }
-    await sleep(SLEEP_MS_AFTER_DELIVERY);
-    const observed = disarmAndCountMediaSendObserver(chatId);
-    const observedCount = observed ? observed.total || 0 : 0;
-    const newlyObservedUnique = addObservedUnique(observed ? (observed.messageIds || []) : []);
-    lastObservedCount = observedCount;
-    actualCount = Math.max(actualCount + newlyReturned, actualCount + newlyObservedUnique);
-    if (cumulativeSeenIds.size === beforeSeenSize && newlyReturned === 0 && newlyObservedUnique === 0) break;
+    if (!anyChanged && typeof rememberDeliveredMediaFn === 'function' && userRecord) {
+      try { rememberDeliveredMediaFn(userRecord, items); } catch (_e) { /* swallow */ }
+    }
     if (actualCount >= promised) break;
+    if (returnedThisRound === 0) break;
   }
 
   if (actualCount > promised) actualCount = promised;
 
   const shortfall = Math.max(0, promised - actualCount);
   if (shortfall > 0) {
-    await alertChronicShortfall(telegram, adminIdResolver, {
-      botUsername,
-      userId,
-      orderId,
-      promised,
-      delivered: actualCount,
-      shortfall,
-    });
+    try {
+      await alertChronicShortfall(telegram, adminIdResolver, {
+        botUsername,
+        userId,
+        orderId,
+        promised,
+        delivered: actualCount,
+        shortfall,
+      });
+    } catch (_e) { /* swallow */ }
   }
 
   let rememberChanged = false;
-  if (typeof rememberDeliveredMediaFn === 'function' && userRecord && cumulativeDeliveredIds.length) {
-    const pseudoItems = cumulativeDeliveredIds.map((id) => ({ _id: id }));
+  if (typeof rememberDeliveredMediaFn === 'function' && userRecord && rememberList.length) {
+    const pseudoItems = rememberList.map((id) => ({ _id: id }));
     rememberChanged = !!rememberDeliveredMediaFn(userRecord, pseudoItems);
   }
 
@@ -267,8 +232,8 @@ async function deliverWithVerification({
     shortfall,
     attempts,
     lastReturnedCount,
-    lastObservedCount,
-    cumulativeReturned,
+    lastObservedCount: lastReturnedCount,
+    cumulativeReturned: actualCount,
     rememberChanged,
   };
 }
