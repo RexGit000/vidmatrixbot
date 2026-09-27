@@ -19,7 +19,7 @@ let _userbotClientAccountId = null;
 let _userbotClientInitLock = null;
 async function getUserbotClient() {
   if (_userbotClientSingleton && _userbotClientAccountId) {
-    if (_userbotClientSingleton.connected) return _userbotClientSingleton;
+    return _userbotClientSingleton;
   }
   if (_userbotClientInitLock) return _userbotClientInitLock;
   _userbotClientInitLock = (async () => {
@@ -43,8 +43,15 @@ async function getUserbotClient() {
       connectionRetries: 2,
       retryDelay: 1000,
     });
-    client.setLogLevel?.('error');
-    try { if (typeof client.on === 'function') client.on('error', () => {}); } catch (_) {}
+    client.setLogLevel?.('none');
+    try { if (typeof client.on === 'function') {
+      client.on('error', (e) => {
+        const msg = String(e?.message || e || '').toLowerCase();
+        if (msg.includes('channels.getchannels') || msg.includes('channel_invalid') || msg.includes('flood')) return;
+        console.warn('[userbot client event err]:', String(e?.message || e || '').slice(0, 200));
+      });
+      client._oldCatchUnhandled = true;
+    } } catch (_) {}
     try { await client.connect({ timeout: 30000 }); } catch (e) {
       console.warn('[userbot] connect failed:', e.message);
       try { await client.destroy?.()?.catch?.(() => {}); } catch (_) {}
@@ -74,31 +81,123 @@ async function getUserbotClient() {
   }
 }
 
+function normalizeSourceChannelIdToUserbot(channelIdAny) {
+  if (channelIdAny == null || channelIdAny === '') return null;
+  const s = String(channelIdAny).trim();
+  const digits = s.replace(/^-100/, '').replace(/^-/, '').replace(/[^0-9]/g, '');
+  if (!digits) return null;
+  const asBigInt = BigInt(digits);
+  if (s.startsWith('-100') || BigInt.asIntN(64, asBigInt) < 0n) {
+    return Number('-100' + digits);
+  }
+  const asNum = Number(digits);
+  if (asNum < 0) return asNum;
+  return Number('-100' + digits);
+}
+
+async function getUserbotEntitySafe(userbotClient, channelIdAny, chatIdAny) {
+  if (!userbotClient || !channelIdAny) return null;
+  let tryList = [];
+  const neg = normalizeSourceChannelIdToUserbot(channelIdAny);
+  if (neg) tryList.push(neg);
+  if (String(channelIdAny).trim() !== String(neg ?? '')) tryList.push(String(channelIdAny).trim());
+  if (chatIdAny) {
+    const tchat = String(chatIdAny).trim();
+    if (!tryList.includes(tchat)) tryList.push(tchat);
+  }
+  let lastErr = null;
+  for (const candidate of tryList) {
+    for (const fn of [
+      (c) => userbotClient.getEntity(c),
+      (c) => userbotClient.getInputEntity(c),
+      (c) => userbotClient.getPeerId(c),
+    ]) {
+      try {
+        const out = await Promise.race([
+          Promise.resolve(fn(candidate)),
+          new Promise((_res, rej) => setTimeout(() => rej(new Error('getEntity_timeout')), 8000)),
+        ]);
+        if (out) return { entity: out, raw: candidate };
+      } catch (e) { lastErr = e; }
+    }
+  }
+  if (lastErr) console.warn('[userbot] getUserbotEntitySafe last error:', String(lastErr.message || lastErr).slice(0, 180), 'src=', channelIdAny);
+  return null;
+}
+
 async function uploadFileViaUserbot(userbotClient, row, chatId) {
   if (!row || !row.source || !row.source.channel_id || !row.source.message_id) return null;
+  let fromEntity = null;
+  let toEntity = null;
   try {
-    const fromPeer = await userbotClient.getInputEntity(Number(row.source.channel_id));
-    const msgIds = [Number(row.source.message_id)];
-    const msgs = await userbotClient.invoke(new Api.channels.GetMessages({ channel: fromPeer, id: msgIds }), { timeout: 20000 });
-    const list = msgs && Array.isArray(msgs.messages) ? msgs.messages : [];
-    if (!list.length) return null;
-    const m = list[0];
-    const media = m && (m.media || (m.message && null));
+    const e1 = await getUserbotEntitySafe(userbotClient, row.source.channel_id, chatId);
+    if (!e1) return null;
+    fromEntity = e1.entity;
+  } catch (e) {
+    console.warn('[userbot] source resolve err:', String(e.message || e).slice(0, 180));
+    return null;
+  }
+  try {
+    const e2 = await getUserbotEntitySafe(userbotClient, chatId, null);
+    if (!e2) return null;
+    toEntity = e2.entity;
+  } catch (e) {
+    console.warn('[userbot] target resolve err:', String(e.message || e).slice(0, 180));
+    return null;
+  }
+  try {
+    const msgId = Number(row.source.message_id);
+    let fetchedMsg = null;
+    const fetchAttempts = [
+      async () => { const m = await userbotClient.getMessages(fromEntity, { ids: [msgId], limit: 1 }); return m && m.length ? m[0] : null; },
+      async () => {
+        const iter = await userbotClient.getHistory(fromEntity, { limit: 10 });
+        const arr = Array.isArray(iter) ? iter : (iter && Array.isArray(iter.messages) ? iter.messages : null);
+        if (!arr) return null;
+        return arr.find(m => Number(m.id) === msgId) || null;
+      },
+    ];
+    for (const fn of fetchAttempts) {
+      try {
+        const got = await fn();
+        if (got) { fetchedMsg = got; break; }
+      } catch (e) {}
+    }
+    if (!fetchedMsg) return null;
+    const media = fetchedMsg.media || null;
     if (!media) return null;
-    const toPeer = await userbotClient.getInputEntity(Number(chatId));
-    const fileFromMedia = await userbotClient.uploadFile({ file: media, workers: 1 }).catch(() => null);
-    if (fileFromMedia) return { ok: true, via: 'userbot_upload' };
-    const forwarded = await userbotClient.invoke(new Api.messages.SendMedia({
-      peer: toPeer,
-      media: media,
-      message: '',
-      randomId: Math.floor(Math.random() * 1e18),
-    }), { timeout: 40000 });
-    if (forwarded && forwarded.id) {
-      return { ok: true, via: 'userbot_sendMedia', messageId: Number(forwarded.id) };
+    const cap = fetchedMsg.message || '';
+    const sendAttempts = [
+      async () => {
+        const res = await userbotClient.invoke(new Api.messages.SendMedia({
+          peer: toEntity,
+          media: media,
+          message: cap,
+          randomId: Math.floor(Math.random() * 1e18),
+        }), { timeout: 60000 });
+        if (res && res.id) return { ok: true, via: 'userbot_sendMedia', messageId: Number(res.id) };
+        return null;
+      },
+      async () => {
+        const res = await userbotClient.sendFile(toEntity, {
+          file: media,
+          caption: cap,
+          workers: 1,
+          progressCallback: undefined,
+        });
+        if (res && res.id) return { ok: true, via: 'userbot_sendFile', messageId: Number(res.id) };
+        return null;
+      },
+    ];
+    for (const fn of sendAttempts) {
+      try {
+        const r = await fn();
+        if (r && r.ok) return r;
+      } catch (_e) {}
     }
     return null;
   } catch (e) {
+    console.warn('[userbot] uploadFileViaUserbot top-level err:', String(e?.message || e || '').slice(0, 200));
     return null;
   }
 }
@@ -410,8 +509,8 @@ async function deliverMedia(telegram, chatId, count, { excludeIds = [], onProgre
   let shouldAbortChat = false;
   let hardFailStreak = 0;
   let hardFailTotal = 0;
-  const HARD_FAIL_ABORT_STREAK = 8;
-  const HARD_FAIL_ABORT_TOTAL = 40;
+  const HARD_FAIL_ABORT_STREAK = 16;
+  const HARD_FAIL_ABORT_TOTAL = 80;
   const PARALLEL_BATCH_SIZE = Number(process.env.DELIVERY_PARALLEL) || 12;
   const SAMPLING_MAX_MULT = 30;
   const SAMPLING_MIN = 120;
@@ -444,14 +543,19 @@ async function deliverMedia(telegram, chatId, count, { excludeIds = [], onProgre
     let hardFailHit = false;
     let via = null;
 
-    const resHot = await hotSendMedia(telegram, chatId, item);
-    if (resHot && resHot.ok) {
-      sentOk = true; via = 'hot';
-      tierCounts.hot += 1; tierElapsed.hot += Date.now() - t0;
-    } else if (resHot && resHot.skippable) {
-      skippableHit = true;
-    } else if (resHot && resHot.hardFail === false) {
-      hardFailHit = true;
+    let lastHot = null;
+    {
+      const th = Date.now();
+      const resHot = await hotSendMedia(telegram, chatId, item);
+      lastHot = resHot;
+      if (resHot && resHot.ok) {
+        sentOk = true; via = 'hot';
+        tierCounts.hot += 1; tierElapsed.hot += Date.now() - th;
+      } else if (resHot && resHot.skippable) {
+        skippableHit = true;
+      } else if (resHot && resHot.hardFail === false) {
+        hardFailHit = true;
+      }
     }
 
     if (!sentOk && !skippableHit && userbotAvailable) {
@@ -463,7 +567,11 @@ async function deliverMedia(telegram, chatId, count, { excludeIds = [], onProgre
       } else if (resUb && resUb.skippable) {
         skippableHit = true; hardFailHit = false;
       } else if (resUb && resUb.hardFail === false) {
-        hardFailHit = true;
+        // Only upgrade to hardFail when hot also explicitly said hardFail (or was unknown fallback)
+        if (!hardFailHit && lastHot && lastHot.hardFail === false) hardFailHit = true;
+      } else {
+        // userbot failed but not a clear error (e.g. entity resolve, session stale): NOT a hardFail, don't count streak.
+        if (hardFailHit && lastHot && lastHot.hardFail !== false) hardFailHit = false;
       }
     }
 
@@ -479,8 +587,15 @@ async function deliverMedia(telegram, chatId, count, { excludeIds = [], onProgre
         } else if (resCold && resCold.skippable) {
           skippableHit = true; hardFailHit = false;
         } else if (resCold && resCold.hardFail === false) {
-          hardFailHit = true;
+          if (!hardFailHit && lastHot && lastHot.hardFail === false) hardFailHit = true;
+        } else {
+          // cold silently failed (not a "hardFail=false" response): do NOT force a streak bump if we only had one tier failing silently
+          // unless hot also explicitly hardFailed
+          if (!lastHot || lastHot.hardFail !== false) hardFailHit = false;
         }
+      } else {
+        // No source at all: if userbot wasn't available and hot returned !ok non-skippable → consider it a soft miss, not hardFail
+        hardFailHit = false;
       }
     }
 
@@ -544,7 +659,7 @@ async function deliverMedia(telegram, chatId, count, { excludeIds = [], onProgre
     `elapsed=${totalElapsed}ms ` +
     `tier(hot=${tierCounts.hot},ub=${tierCounts.userbot},cold=${tierCounts.cold}) ` +
     `elapsed(hot=${tierElapsed.hot}ms,ub=${tierElapsed.userbot}ms,cold=${tierElapsed.cold}ms) ` +
-    `streak=${hardFailStreak} fails=${hardFailTotal} abortChat=${shouldAbortChat ? 1 : 0}`
+    `streak=${hardFailStreak} fails=${hardFailTotal} abortChat=${shouldAbortChat ? 1 : 0} ubAvail=${userbotAvailable ? 1 : 0}`
   );
   return finalSlice;
 }
